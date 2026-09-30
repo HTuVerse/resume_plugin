@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { polishText, suggestSlotMatches } from '../../application/api'
-import { buildFactIndex, fieldsNeedingAi, resolveField, type FactIndex } from '../../features/autofill/dataResolver'
+import { buildFactIndex, fieldsNeedingAi, isPreviewFillable, resolveField, type FactIndex } from '../../features/autofill/dataResolver'
 import { factToSlot } from '../../features/autofill/match/factToSlot'
 import { aliasHit, aliasSectionCount, slotById } from '../../features/ontology/slotRegistry'
 import { looksLikeFieldPrompt, plainChoiceText } from '../../features/ontology/optionMatch'
@@ -13,6 +13,7 @@ import { classifyPageInput, knowledgeIdentity, mergeIntoKnowledge, type LearnedE
 import { isLearnedDismissed, learnedDismissKey } from '../../features/rag/learnedDismiss'
 import { alignFamilyItem, familyItemForRelation, isFamilyField, isRelationField, relationKey } from '../../features/autofill/familyAlign'
 import { alignNamedItem, dateSlotId, fillNamedItem, nameSlotId, namedSectionOf } from '../../features/autofill/namedSegment'
+import { pageSegmentItem } from '../../features/autofill/pageSegment'
 import { recordCorrection, recordFailure, recordHit, recordObservation } from '../../features/siteRules/ruleStore'
 import { beginPanelDrag, closePanel, onContentEvent, requestContent, resizePanel } from '../bridge/panelBridge'
 import { loadAiSettings, loadCurrentResume, loadProfile, saveProfile } from '../../infrastructure/storage/store'
@@ -219,10 +220,11 @@ function dragFromHeader(event: PointerEvent) {
 
 function familyPeers(field: FormField): FormField[] {
   if (!isFamilyField(field)) return []
+  const pageItem = pageSegmentItem(field, fields.value)
   return fields.value.filter(other => {
     if (!isFamilyField(other)) return false
     if (field.repeatGroupId && other.repeatGroupId) return other.repeatGroupId === field.repeatGroupId
-    return Math.max(1, other.item || 1) === Math.max(1, field.item || 1)
+    return pageSegmentItem(other, fields.value) === pageItem
   })
 }
 
@@ -245,17 +247,18 @@ function segmentRelation(field: FormField, override?: { id: string; value: strin
 function familySegmentItem(field: FormField, override?: { id: string; value: string }): number | null | undefined {
   if (!isFamilyField(field)) return undefined
   const relation = segmentRelation(field, override)
-  if (!relation) return undefined
+  if (!relation) return pageSegmentItem(field, fields.value)
   return familyItemForRelation(allFacts.value, relation) ?? null
 }
 
 function namedPeers(field: FormField): FormField[] {
   const section = namedSectionOf(field)
   if (!section) return []
+  const pageItem = pageSegmentItem(field, fields.value)
   return fields.value.filter(other => {
     if (namedSectionOf(other) !== section) return false
     if (field.repeatGroupId && other.repeatGroupId) return other.repeatGroupId === field.repeatGroupId
-    return Math.max(1, other.item || 1) === Math.max(1, field.item || 1)
+    return pageSegmentItem(other, fields.value) === pageItem
   })
 }
 
@@ -275,7 +278,7 @@ function namedAlignInput(field: FormField, override?: { id: string; value: strin
   const date = anchorOnPage(field, dateSlotId(section), override)
   return {
     section,
-    pageItem: Math.max(1, field.item || 1),
+    pageItem: pageSegmentItem(field, fields.value),
     name: name.present ? name.value : undefined,
     date: date.value,
     facts: allFacts.value
@@ -286,7 +289,8 @@ function namedAlignInput(field: FormField, override?: { id: string; value: strin
 function namedSegmentItem(field: FormField): number | null | undefined {
   const input = namedAlignInput(field)
   if (!input) return undefined
-  return fillNamedItem(input)
+  const aligned = fillNamedItem(input)
+  return aligned === undefined ? input.pageItem : aligned
 }
 
 /**
@@ -342,7 +346,7 @@ async function runAutoFill() {
   knowledgeWatch.value = false
   learned.value = []
   dismissedLearned.clear()
-  await scan()
+  await scan({ probeOptions: true })
   if (!fields.value.length) { status.value = '当前页面没有发现可填写的表单字段。'; return }
   if (featureSettings.aiMapping && aiReady.value) await aiMatch()
   if (Object.values(selections).some(Boolean)) await fill(undefined, { armKnowledgeWatch: true })
@@ -387,7 +391,7 @@ async function expandRepeatsIfNeeded(): Promise<number> {
   return rows.reduce((sum, row) => sum + (row.count || 0), 0)
 }
 
-async function scan() {
+async function scan(options: { probeOptions?: boolean } = {}) {
   busy.value = true
   status.value = '正在读取当前页面…'
   fields.value = []
@@ -397,7 +401,7 @@ async function scan() {
   dismissedLearned.clear()
   try {
     facts.value = tagFacts((await loadProfile()).facts, 'profile')
-    const response = await requestContent({ type: 'SCAN' })
+    const response = await requestContent({ type: 'SCAN', probeOptions: options.probeOptions === true })
     if (response.error) throw new Error(response.error)
     applyScan(response)
     let added = 0
@@ -405,7 +409,7 @@ async function scan() {
       status.value = '档案里的经历比页面上多，正在补行…'
       added = await expandRepeatsIfNeeded()
       if (added) {
-        const again = await requestContent({ type: 'SCAN' })
+        const again = await requestContent({ type: 'SCAN', probeOptions: options.probeOptions === true })
         if (again.error) throw new Error(again.error)
         applyScan(again)
       }
@@ -514,11 +518,14 @@ async function selectionChanged(field: FormField) {
 
 async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolean }) {
   const targets = onlyFieldId ? fields.value.filter(field => field.id === onlyFieldId) : fields.value
-  // 硬约束：宁可留空并提示，不可猜填——批量填写只写入「明确」字段；
-  // 待确认字段需用户在下拉中确认（确认后状态变为 ready）或单项填写。
-  const pendingCount = onlyFieldId ? 0 : targets.filter(field => resolutions[field.id]?.status === 'needs-confirmation').length
+  // 低置信 AI 结果虽然仍需用户核对，但已有经过值域/控件闸门校验的值，
+  // 可以先写入并用橙色高亮标记；多候选、值域不符等没有可靠写入值的结果仍留空。
+  const pendingCount = onlyFieldId ? 0 : targets.filter(field => {
+    const resolution = resolutions[field.id]
+    return resolution?.status === 'needs-confirmation' && !isPreviewFillable(resolution)
+  }).length
   const emptyCount = onlyFieldId ? 0 : targets.filter(field => resolutions[field.id]?.status === 'empty').length
-  const eligible = onlyFieldId ? targets : targets.filter(field => resolutions[field.id]?.status === 'ready')
+  const eligible = onlyFieldId ? targets : targets.filter(field => isPreviewFillable(resolutions[field.id]))
   const values: FillRequest[] = eligible.flatMap(field => {
     const resolution = resolutions[field.id]
     const fact = allFacts.value.find(item => item.id === selections[field.id])
@@ -539,7 +546,7 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
     }
     const watchNote = options?.armKnowledgeWatch ? '正在监测你之后在网页上的修改。' : ''
     status.value = pendingCount
-      ? `没有达到自动填写阈值的字段；${pendingCount} 个待确认（低于匹配阈值或选项需核对）请先在下拉中逐项确认。${watchNote}`
+      ? `${pendingCount} 个字段仍待确认（候选冲突或选项需核对），请先在下拉中逐项确认。${watchNote}`
       : `请先为至少一个字段选择档案信息。${watchNote}`
     return
   }
@@ -587,7 +594,7 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
       learned.value = []
     }
     const watchNote = options?.armKnowledgeWatch ? '填写已完成，正在监测你之后在网页上的修改。' : ''
-    status.value = `已填写 ${filled} 项，原值保留 ${kept} 项，失败 ${failed} 项${pendingCount ? `；${pendingCount} 个待确认（低于匹配阈值或选项需核对）未自动填写` : ''}${emptyCount ? `；${emptyCount} 个字段知识库无数据` : ''}。${watchNote}提交前请检查网页。`
+    status.value = `已填写 ${filled} 项，原值保留 ${kept} 项，失败 ${failed} 项${pendingCount ? `；${pendingCount} 个字段仍待确认（候选冲突或选项需核对）` : ''}${emptyCount ? `；${emptyCount} 个字段知识库无数据` : ''}。${watchNote}低置信匹配已用橙色标记，请在「核对匹配」中确认后再提交。`
   } catch (error) { status.value = error instanceof Error ? error.message : '填写失败。' }
   finally { busy.value = false }
 }
@@ -1048,9 +1055,9 @@ function resultDetail(result: FillResult): string {
     </template>
 
     <div v-else class="panel-body">
-      <div class="panel-toolbar"><button @click="openCompactView">‹ 返回缩小态</button><span>核对匹配</span><button @click="scan">↻ 重新识别</button></div>
+      <div class="panel-toolbar"><button @click="openCompactView">‹ 返回缩小态</button><span>核对匹配</span><button @click="scan()">↻ 重新识别</button></div>
       <div class="panel-metrics"><div><b>{{ fields.length }}</b><small>识别字段</small></div><div><b>{{ matchedCount }}</b><small>成功匹配</small></div><div><b>{{ report.filled.length }}</b><small>已填写</small></div><div><b>{{ report.failed.length }}</b><small>失败</small></div></div>
-      <p v-if="newFieldsHint" class="picker-notice">页面出现 {{ newFieldsHint }} 个新字段。<button @click="scan">重新识别</button></p>
+      <p v-if="newFieldsHint" class="picker-notice">页面出现 {{ newFieldsHint }} 个新字段。<button @click="scan()">重新识别</button></p>
       <p v-if="pickerActive" class="picker-notice">请点击网页中的目标输入框。<button @click="cancelPicker">取消</button></p>
       <p class="panel-status" role="status">{{ status }}</p>
       <div class="panel-action-row"><button class="panel-primary" :disabled="busy" @click="fill()">填写匹配字段</button><button :disabled="busy || !fields.length || !featureSettings.aiMapping" :title="aiReady ? '让 AI 读懂表单每个字段在问什么，再按知识库取值（值仍经校验）' : '请先配置 AI'" @click="aiMatch">AI 分析表单</button><button @click="undo">撤销</button></div>

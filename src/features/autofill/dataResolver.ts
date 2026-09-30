@@ -39,9 +39,9 @@ export function buildFactIndex(profileFacts: Fact[], resumeFacts: Fact[] = []): 
 export interface ResolveOptions {
   /** 用户显式开启自动填写的敏感槽位 ID 集合（F54）。 */
   enabledSensitiveSlots?: Set<string>
-  /** AI 仲裁建议，仍需过闸门。置信度达到阈值才自动填写。 */
+  /** AI 仲裁建议，仍需过闸门；低置信结果会先预填并标记为待确认。 */
   aiSuggestion?: SlotSuggestion
-  /** AI 自动填写阈值（0–100）。达到且闸门通过 → ready，否则待确认。默认 85。 */
+  /** AI 自动填写匹配阈值（0–100）。达到且闸门通过 → ready，否则待确认。默认 85。 */
   aiMatchThreshold?: number
   /**
    * 家庭关系按称谓对齐后的知识库条目。
@@ -53,6 +53,17 @@ export interface ResolveOptions {
    * 同一页既有工作又有实习时不要开，避免两段填成同一份。
    */
   legacyWorkFallback?: boolean
+}
+
+/**
+ * 可先写入网页、但仍需用户在核对界面确认的结果。
+ * 目前只包含已通过值域/控件闸门、仅因 AI 置信度低于阈值而待确认的结果。
+ */
+export function isPreviewFillable(resolved: ResolvedField | undefined): boolean {
+  return resolved?.status === 'ready'
+    || (resolved?.status === 'needs-confirmation'
+      && resolved.reasonCode === 'ai-suggested'
+      && Boolean(resolved.value.trim()))
 }
 
 function candidateOf(field: FormField, fact: Fact, reason: string): FieldCandidate {
@@ -129,15 +140,17 @@ function gatedResolution(field: FormField, fact: Fact, slot: string | undefined,
 }
 
 /** 自定义字段（无槽位）→ 知识库自定义键名全等即自动填写（与槽位别名全等同一标准）。 */
-function resolveCustomField(field: FormField, index: FactIndex): ResolvedField | null {
+function resolveCustomField(field: FormField, index: FactIndex, segmentItem?: number | null): ResolvedField | null {
   const labelKey = normalize(field.label)
   if (!labelKey) return null
   const facts = index.byCustomKey.get(labelKey) || []
   if (!facts.length) return null
-  const sameItem = field.item ? facts.filter(fact => Math.max(1, fact.item || 1) === field.item) : []
+  if (segmentItem === null) return null
+  const targetItem = segmentItem || field.item
+  const sameItem = targetItem ? facts.filter(fact => Math.max(1, fact.item || 1) === targetItem) : []
   // 重复段字段不能在同段缺值时退回其它段，否则父亲/母亲、不同经历会互相串写。
-  if (field.item && !sameItem.length) return null
-  const matched = field.item ? sameItem : facts
+  if (targetItem && !sameItem.length) return null
+  const matched = targetItem ? sameItem : facts
   const preferred = matched.find(fact => fact.source === 'profile') || matched[0]
   const gate = gateValue(undefined, field, preferred.value)
   if (!gate.ok) return null
@@ -218,7 +231,7 @@ export function resolveField(field: FormField, index: FactIndex, options: Resolv
   }
   if (!slot) {
     // 自定义字段回退：只做字段名全等（不做子串），全等即自动填写。
-    const custom = resolveCustomField(field, index)
+    const custom = resolveCustomField(field, index, segmentItem)
     if (custom) return custom
     if (field.slotStatus === 'ambiguous') {
       return empty(field, '多个槽位得分接近，无法确定字段语义，请手动选择', 'ambiguous-slot')

@@ -70,6 +70,31 @@ function byAria(trigger: HTMLElement): HTMLElement | null {
   return null
 }
 
+/**
+ * 返回当前已经展开、且最可能属于该触发器的选项浮层。
+ *
+ * 写入前先走这一层很重要：扫描阶段或站点自身可能已经把下拉展开；
+ * 此时再次点击触发器通常会把它关掉，导致后续永远找不到选项。
+ */
+export function visiblePopupFor(trigger: HTMLElement): HTMLElement | null {
+  const ariaPopup = byAria(trigger)
+  if (ariaPopup?.querySelector(OPTION_SELECTOR)) return ariaPopup
+
+  const rect = trigger.getBoundingClientRect()
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>(POPUP_SELECTOR))
+    .filter(popup => isElementVisible(popup) && popup.querySelector(OPTION_SELECTOR))
+    .map(popup => {
+      const popupRect = popup.getBoundingClientRect()
+      const dx = Math.max(rect.left - popupRect.right, popupRect.left - rect.right, 0)
+      const dy = Math.max(rect.top - popupRect.bottom, popupRect.top - rect.bottom, 0)
+      return { popup, distance: Math.hypot(dx, dy) }
+    })
+    .sort((a, b) => a.distance - b.distance)
+  if (!candidates.length) return null
+  if (candidates.length > 1 && Math.abs(candidates[0].distance - candidates[1].distance) < 8) return null
+  return candidates[0].popup
+}
+
 export interface PopupWatch {
   /** 在触发展开动作后调用，轮询定位浮层。 */
   locate(timeoutMs?: number): Promise<HTMLElement | null>
@@ -120,19 +145,7 @@ export function watchForPopup(trigger: HTMLElement): PopupWatch {
     if (found) return found
 
     // 4. 几何兜底：可见候选中取距触发元素最近者；等距 ≥2 个则放弃
-    const rect = trigger.getBoundingClientRect()
-    const candidates = Array.from(document.querySelectorAll<HTMLElement>(POPUP_SELECTOR))
-      .filter(popup => isElementVisible(popup) && popup.querySelector(OPTION_SELECTOR))
-      .map(popup => {
-        const popupRect = popup.getBoundingClientRect()
-        const dx = Math.max(rect.left - popupRect.right, popupRect.left - rect.right, 0)
-        const dy = Math.max(rect.top - popupRect.bottom, popupRect.top - rect.bottom, 0)
-        return { popup, distance: Math.hypot(dx, dy) }
-      })
-      .sort((a, b) => a.distance - b.distance)
-    if (!candidates.length) return null
-    if (candidates.length > 1 && Math.abs(candidates[0].distance - candidates[1].distance) < 8) return null
-    return candidates[0].popup
+    return visiblePopupFor(trigger)
   }
 
   return { locate, dispose: () => observer.disconnect() }

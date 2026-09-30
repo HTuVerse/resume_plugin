@@ -2,6 +2,7 @@ import type { FormField } from '../../../domain/types'
 import { isPlaceholderOption } from '../../ontology/optionMatch'
 import type { FieldRef } from './collector'
 import { OPTION_SELECTOR, watchForPopup } from '../write/popupLocator'
+import { isElementVisible, wait } from '../write/domUtils'
 
 const MAX_PROBES = 16
 const PROBE_TIMEOUT = 280
@@ -27,9 +28,43 @@ function click(element: HTMLElement): void {
   element.click()
 }
 
-function closePopup(element: HTMLElement): void {
-  element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
-  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
+function safeToProbe(element: HTMLElement): boolean {
+  const popupType = element.getAttribute('aria-haspopup')
+    || element.querySelector('[aria-haspopup]')?.getAttribute('aria-haspopup')
+  if (popupType === 'dialog') return false
+  return Boolean(
+    element.matches('[role="combobox"],[aria-haspopup="listbox"],[aria-haspopup="tree"],[aria-haspopup="menu"]')
+    || element.querySelector('[role="combobox"],[aria-haspopup="listbox"],[aria-haspopup="tree"],[aria-haspopup="menu"]')
+    || element.closest('.ant-select,.el-select,.arco-select,.n-select,.ivu-select,.semi-select,.t-select,.ant-cascader,.el-cascader,.arco-cascader')
+  )
+}
+
+async function closePopup(element: HTMLElement, popup: HTMLElement | null): Promise<void> {
+  const escape = () => new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })
+  const input = element instanceof HTMLInputElement ? element : element.querySelector<HTMLElement>('input,[role="combobox"]')
+  input?.dispatchEvent(escape())
+  element.dispatchEvent(escape())
+  document.dispatchEvent(escape())
+  window.dispatchEvent(escape())
+  ;(document.activeElement as HTMLElement | null)?.blur?.()
+  await wait(40)
+  if (!popup?.isConnected || !isElementVisible(popup)) {
+    // 浮层定位器可能认不出站点自定义的 dialog；仍先发一次外部点击，
+    // 避免探测动作把一个无法识别的弹层遗留在页面上。
+    document.body.click()
+    return
+  }
+
+  // 部分组件不响应合成 Escape，但会响应外部点击。
+  document.body.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true }))
+  document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+  document.body.click()
+  await wait(40)
+  if (!popup.isConnected || !isElementVisible(popup)) return
+
+  // 最后按开关语义再点一次；写入器也能识别仍然展开的浮层，不会反向关掉。
+  click(element)
+  await wait(40)
 }
 
 /**
@@ -45,11 +80,13 @@ export async function probeEmptyChoiceOptions(fields: FormField[], refs: Map<str
     if (ready.length >= 2) continue
     const ref = refs.get(field.fingerprint)
     if (!ref?.element.isConnected) continue
+    if (!safeToProbe(ref.element)) continue
     probed += 1
     const watch = watchForPopup(ref.element)
+    let popup: HTMLElement | null = null
     try {
       click(ref.element)
-      const popup = await watch.locate(PROBE_TIMEOUT)
+      popup = await watch.locate(PROBE_TIMEOUT)
       if (!popup) continue
       const texts = Array.from(popup.querySelectorAll<HTMLElement>(OPTION_SELECTOR))
         .map(node => (node.textContent || '').replace(/\s+/g, ' ').trim())
@@ -59,7 +96,7 @@ export async function probeEmptyChoiceOptions(fields: FormField[], refs: Map<str
     } catch {
       /* 这个控件打不开，继续扫别的 */
     } finally {
-      closePopup(ref.element)
+      await closePopup(ref.element, popup)
       watch.dispose()
     }
   }

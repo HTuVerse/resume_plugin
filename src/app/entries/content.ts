@@ -275,14 +275,14 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     }
   })
 
-  async function frameScan(): Promise<{ fields: FormField[]; url: string; title: string }> {
+  async function frameScan(probeOptions = false): Promise<{ fields: FormField[]; url: string; title: string }> {
     const [rules, learnedAliases] = await Promise.all([
       loadSiteRules().then(rows => rulesForDomain(rows, location.hostname)).catch(() => []),
       loadLearnedAliases().catch(() => [])
     ])
     const output = scanPage()
     refs = output.refs
-    await probeEmptyChoiceOptions(output.fields, refs).catch(() => undefined)
+    if (probeOptions) await probeEmptyChoiceOptions(output.fields, refs).catch(() => undefined)
     hasScanned = true
     lastFingerprints = new Set(output.fields.map(field => field.fingerprint))
     for (const field of output.fields) {
@@ -490,10 +490,10 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     return { clicked }
   }
 
-  chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number; demands?: Array<{ section: string; missing: number }> }, _sender, respond) => {
+  chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number; probeOptions?: boolean; demands?: Array<{ section: string; missing: number }> }, _sender, respond) => {
     if (message.type === 'FRAME_SCAN') {
       denyUnlessLicensed(respond, () => {
-        frameScan().then(respond).catch(error => respond({ error: String(error) }))
+        frameScan(message.probeOptions === true).then(respond).catch(error => respond({ error: String(error) }))
       })
       return true
     }
@@ -569,13 +569,13 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     return response?.frameIds?.length ? response.frameIds : [0]
   }
 
-  async function aggregateScan(): Promise<{ fields: FormField[]; context: { pageTitle: string; url: string; frames: Array<{ frameId: number; url: string; fieldCount: number }> } }> {
+  async function aggregateScan(probeOptions = false): Promise<{ fields: FormField[]; context: { pageTitle: string; url: string; frames: Array<{ frameId: number; url: string; fieldCount: number }> } }> {
     const frameIds = await listFrames()
     const fields: FormField[] = []
     const frames: Array<{ frameId: number; url: string; fieldCount: number }> = []
     let pageTitle = document.title
     for (const frameId of frameIds) {
-      const response = await frameCall<{ fields?: FormField[]; url?: string; title?: string; error?: string } | null>(frameId, { type: 'FRAME_SCAN' }).catch(() => null)
+      const response = await frameCall<{ fields?: FormField[]; url?: string; title?: string; error?: string } | null>(frameId, { type: 'FRAME_SCAN', probeOptions }).catch(() => null)
       if (!response?.fields) continue
       for (const field of response.fields) {
         field.frameId = frameId
@@ -865,9 +865,9 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   // ─── 面板消息路由（仅 COORDINATOR）──────────────────────────
 
-  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
+  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; probeOptions?: boolean; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
     if (!(await loadLicense())) return { error: LICENSE_REQUIRED_MESSAGE }
-    if (message.type === 'SCAN') return aggregateScan()
+    if (message.type === 'SCAN') return aggregateScan(message.probeOptions === true)
     if (message.type === 'EXPAND_REPEATS') return aggregateExpand(message.demands || [])
     if (message.type === 'FILL') return aggregateFill(message.values || []).then(results => ({ results }))
     if (message.type === 'UNDO') return aggregateUndo().then(results => ({ results }))

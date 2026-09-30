@@ -280,6 +280,39 @@ describe('下拉框与单选的识别、填写', () => {
     expect(document.querySelector('.el-select__selected-item')?.textContent).toBe('硕士')
   })
 
+  it('扫描遗留的已展开下拉不会被再次点击关闭，直接选择并回填', async () => {
+    document.body.innerHTML = `
+      <div class="el-form-item">
+        <label class="el-form-item__label">学历</label>
+        <div class="el-select"><div class="el-select__wrapper"><input readonly placeholder="请选择"></div></div>
+      </div>
+      <div class="el-select-dropdown" style="display:block">
+        <li class="el-select-dropdown__item">本科</li>
+        <li class="el-select-dropdown__item">硕士</li>
+      </div>`
+    const dropdown = document.querySelector<HTMLElement>('.el-select-dropdown')!
+    const select = document.querySelector<HTMLElement>('.el-select')!
+    let triggerClicks = 0
+    select.addEventListener('click', () => {
+      triggerClicks += 1
+      dropdown.style.display = dropdown.style.display === 'none' ? 'block' : 'none'
+    })
+    dropdown.querySelectorAll('li')[1].addEventListener('click', () => {
+      const selected = document.createElement('span')
+      selected.className = 'el-select__selected-item'
+      selected.textContent = '硕士'
+      select.append(selected)
+      dropdown.style.display = 'none'
+    })
+    const scanned = scanPage()
+    const field = scanned.fields.find(item => item.kind === 'combobox')!
+    const ref = scanned.refs.get(field.fingerprint)!
+    const execution = await executeFill({ fieldId: field.id, value: '硕士' }, () => ref)
+    expect(execution.result.status).toBe('filled')
+    expect(triggerClicks).toBe(0)
+    expect(document.querySelector('.el-select__selected-item')?.textContent).toBe('硕士')
+  })
+
   it('时间输入按 HH:mm 写入', async () => {
     document.body.innerHTML = '<input type="time">'
     const scanned = scanPage()

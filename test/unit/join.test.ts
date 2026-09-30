@@ -43,13 +43,13 @@ describe('gateValue（F04 硬闸门）', () => {
     const result = gateValue(undefined, field, '英语、韩语')
     expect(result.ok).toBe(false)
   })
-  it('选择类控件读不到两个真实选项时待确认，不自动填写', () => {
+  it('选择类控件静态读不到选项时交给写入器动态展开并唯一匹配', () => {
     const empty = gateValue(slotById('personal.gender'), makeField({ kind: 'combobox', options: [] }), '男')
     expect(empty.ok).toBe(true)
-    if (empty.ok) expect(empty.needsConfirmation).toBe(true)
+    if (empty.ok) expect(empty.needsConfirmation).toBe(false)
     const placeholder = gateValue(slotById('education.degree'), makeField({ kind: 'select', options: ['请选择'] }), '本科')
     expect(placeholder.ok).toBe(true)
-    if (placeholder.ok) expect(placeholder.needsConfirmation).toBe(true)
+    if (placeholder.ok) expect(placeholder.needsConfirmation).toBe(false)
   })
   it('全等命中直接通过，不需确认', () => {
     const field = makeField({ kind: 'radio', options: ['男', '女'] })

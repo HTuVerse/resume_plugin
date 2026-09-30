@@ -6,7 +6,7 @@ import { booleanValue } from '../../ontology/synonyms'
 import { isOngoingDate, normalizeDateValue, splitOngoingRange } from '../../ontology/validators'
 import { optionLabel } from '../scan/labelResolver'
 import { dispatchFieldEvents, pollUntil, setNativeChecked, setNativeSelect, setNativeText, wait } from './domUtils'
-import { popupOptions, watchForPopup } from './popupLocator'
+import { popupOptions, visiblePopupFor, watchForPopup } from './popupLocator'
 
 /** 按通用分隔符拆开多级值。连写的行政区名称再按后缀切一刀，这只用于拆字。 */
 export function splitCascadeValue(value: string): string[] {
@@ -703,12 +703,13 @@ const comboboxRecognizer: ControlRecognizer = {
   read: ctx => readCurrentValue(ctx.ref),
   async write(ctx, value) {
     const trigger = ctx.ref.element
+    const alreadyOpen = visiblePopupFor(trigger)
     const watch = watchForPopup(trigger)
     try {
       const clickable = trigger.querySelector<HTMLElement>('.ant-select-selector,.el-select__wrapper,.el-input__wrapper,.el-input,.arco-select-view,.n-base-selection,.ivu-select-selection,.semi-select-selection,.t-select__wrap,.t-input__wrap') || trigger
-      clickElement(clickable)
+      if (!alreadyOpen) clickElement(clickable)
       const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
-      const popup = await watch.locate()
+      const popup = alreadyOpen || await watch.locate()
       if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
 
       if (shouldStepCascade(value)) {
@@ -769,6 +770,7 @@ const cascaderRecognizer: ControlRecognizer = {
   read: ctx => readCurrentValue(ctx.ref),
   async write(ctx, value) {
     const trigger = ctx.ref.element
+    const alreadyOpen = visiblePopupFor(trigger)
     const watch = watchForPopup(trigger)
     const rollback = async () => {
       trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
@@ -778,8 +780,8 @@ const cascaderRecognizer: ControlRecognizer = {
       await wait(100)
     }
     try {
-      clickElement(trigger)
-      const popup = await watch.locate()
+      if (!alreadyOpen) clickElement(trigger)
+      const popup = alreadyOpen || await watch.locate()
       if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
       const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
       if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }

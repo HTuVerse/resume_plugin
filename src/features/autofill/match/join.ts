@@ -46,18 +46,12 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
   }
 
   // 4. 选项可达性校验。下拉和级联与原生 select 同一套匹配。
-  // 选择类控件读不到至少两个真实选项时，不能当成已经核对过，留待确认。
+  // 静态扫描读不到选项时，不在这里拦住明确字段。真正写入时会展开控件、
+  // 只点击唯一匹配项并回读确认；找不到或有歧义仍会失败，不会猜填。
+  // 这也让依赖上游字段、稍后才加载选项的原生 select 能进入延迟填写队列。
   if (['select', 'multiselect', 'radio', 'checkbox', 'combobox', 'cascade'].includes(field.kind)) {
     const usable = field.options.filter(option => option.trim() && !isPlaceholderOption(option))
-    if (usable.length < 2) {
-      return {
-        ok: true,
-        value,
-        needsConfirmation: true,
-        reason: '页面没有读到足够的选项，请确认后再填写',
-        reasonCode: 'needs-confirmation'
-      }
-    }
+    if (!usable.length) return { ok: true, value, needsConfirmation: false }
     const values = field.kind === 'multiselect' || field.kind === 'checkbox'
       ? value.split(/[,，、|/]/).map(item => item.trim()).filter(Boolean)
       : field.kind === 'cascade'

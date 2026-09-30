@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Fact, FormField } from '../../src/domain/types'
-import { buildFactIndex, fieldsNeedingAi, resolveField } from '../../src/features/autofill/dataResolver'
+import { buildFactIndex, fieldsNeedingAi, isPreviewFillable, resolveField } from '../../src/features/autofill/dataResolver'
 
 function makeFact(partial: Partial<Fact>): Fact {
   return { id: crypto.randomUUID(), group: '基本信息', item: 1, key: '姓名', value: '张三', evidence: '', ...partial }
@@ -88,6 +88,7 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     const resolved = resolveField(field, index)
     expect(resolved.status).toBe('needs-confirmation')
     expect(resolved.reasonCode).toBe('multiple-candidates')
+    expect(isPreviewFillable(resolved)).toBe(false)
   })
   it('AI 建议槽位也走闸门（F42）：值域外 → needs-confirmation 而非填入', () => {
     const index = buildFactIndex([makeFact({ group: '基本信息', key: '政治面貌', value: '随便写的' })], [])
@@ -97,6 +98,7 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     })
     expect(resolved.status).toBe('needs-confirmation')
     expect(resolved.value).not.toBe('随便写的')
+    expect(isPreviewFillable(resolved)).toBe(false)
   })
   it('语义模糊且无 AI 建议 → 待用户确认（携带理由，F07）', () => {
     const index = buildFactIndex([makeFact({})], [])
@@ -111,6 +113,17 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     const resolved = resolveField(field, index)
     expect(resolved.status).toBe('ready')
     expect(resolved.value).toBe('E12345')
+  })
+  it('重复段的自定义字段使用对齐后的段号，不重复取第一段', () => {
+    const index = buildFactIndex([
+      makeFact({ id: 'custom-1', group: '项目经验', item: 1, key: '技术亮点', value: '第一段亮点' }),
+      makeFact({ id: 'custom-2', group: '项目经验', item: 2, key: '技术亮点', value: '第二段亮点' })
+    ], [])
+    const field = makeField({ label: '技术亮点', group: '项目经验', sectionId: 'project', slotStatus: 'unknown' })
+    const resolved = resolveField(field, index, { segmentItem: 2 })
+    expect(resolved.status).toBe('ready')
+    expect(resolved.value).toBe('第二段亮点')
+    expect(resolved.factId).toBe('custom-2')
   })
   it('AI 指定知识库条目：置信度达到阈值 → ready', () => {
     const fact = makeFact({ id: 'name-1', key: '名字', value: '张三' })
@@ -167,6 +180,7 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     })
     expect(resolved.value).toBe('张三')
     expect(resolved.status).toBe('needs-confirmation')
+    expect(isPreviewFillable(resolved)).toBe(true)
   })
   it('AI 粒度适配：生源地「江西吉安永丰」按表单要求截取到市', () => {
     const fact = makeFact({ id: 'origin-1', group: '基本信息', key: '高考生源地', value: '江西吉安永丰' })
