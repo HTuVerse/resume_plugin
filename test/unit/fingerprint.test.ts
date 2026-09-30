@@ -33,6 +33,17 @@ describe('指纹稳定性', () => {
     const second = fieldFingerprint({ element: render('<form><input id="rc_select_9" name="school" /></form>'), label: '学校', kind: 'text' })
     expect(first).toBe(second)
   })
+  it('外层多包一层 div 不改变已有标签和 name 的指纹', () => {
+    const first = fieldFingerprint({ element: render('<form><div><input name="school" /></div></form>'), label: '学校名称', kind: 'text', repeatIndex: 1, sectionId: 'education' })
+    const second = fieldFingerprint({ element: render('<form><div><div><input name="school" /></div></div></form>'), label: '学校名称', kind: 'text', repeatIndex: 1, sectionId: 'education' })
+    expect(first).toBe(second)
+  })
+  it('同一标签在不同板块指纹不同', () => {
+    const element = render(html)
+    const education = fieldFingerprint({ element, label: '开始时间', kind: 'date', repeatIndex: 1, sectionId: 'education' })
+    const project = fieldFingerprint({ element, label: '开始时间', kind: 'date', repeatIndex: 1, sectionId: 'project' })
+    expect(education).not.toBe(project)
+  })
   it('不同段号产生不同指纹（防串段）', () => {
     const element = render(html)
     const first = fieldFingerprint({ element, label: '学校名称', kind: 'text', repeatIndex: 1 })

@@ -32,6 +32,8 @@ export const OPTION_SELECTOR = [
   '.t-select-option',
   '.ivu-select-item',
   '.time-select-item',
+  '[class*="select-option"]',
+  '[class*="dropdown-item"]',
   'li:not([aria-disabled="true"])'
 ].join(',')
 

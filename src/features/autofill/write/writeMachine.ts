@@ -1,12 +1,12 @@
 import type { FillRequest, FillResult } from '../../../domain/types'
 import type { FieldRef } from '../scan/collector'
 import { normalize } from '../../../shared/normalize'
-import { optionEquivalent } from '../../ontology/optionMatch'
+import { isPlaceholderOption, optionEquivalent } from '../../ontology/optionMatch'
 import { expandCandidates } from '../../ontology/synonyms'
 import { normalizeDateValue } from '../../ontology/validators'
 import { readCurrentValue } from '../scan/collector'
 import { isElementVisible, pollUntil, wait } from './domUtils'
-import { resolveRecognizer, type ControlRecognizer } from './recognizers'
+import { resolveRecognizer, splitCascadeValue, type ControlRecognizer } from './recognizers'
 
 /**
  * 写入-回读-重试状态机（F14，TECH_DESIGN §9）。
@@ -20,6 +20,23 @@ import { resolveRecognizer, type ControlRecognizer } from './recognizers'
 const DEFAULT_SETTLE_TIMEOUT = 2000
 const MAX_SYNONYM_RETRIES = 3
 const MAX_REOPEN_RETRIES = 2
+const MAX_CANDIDATES = 6
+
+/** 本站记过的写法在前，档案原值其次，同义值表最后。 */
+export function fillCandidates(request: FillRequest): string[] {
+  const ordered: string[] = []
+  const seen = new Set<string>()
+  const push = (value: string) => {
+    const text = value.trim()
+    if (!text || seen.has(text)) return
+    seen.add(text)
+    ordered.push(text)
+  }
+  for (const value of request.priorValues || []) push(value)
+  push(request.value)
+  for (const value of expandCandidates(request.value).slice(0, MAX_SYNONYM_RETRIES)) push(value)
+  return ordered.slice(0, MAX_CANDIDATES)
+}
 
 export interface UndoRecord {
   fieldId: string
@@ -51,12 +68,13 @@ export function valuesEquivalent(ref: FieldRef, actual: string, expected: string
     const actualNorm = normalizeDateValue(actual, monthOnly)
     return actualNorm === expectedNorm
   }
-  if (['select', 'radio', 'combobox'].includes(kind)) return optionEquivalent(actual, expected)
-  if (kind === 'cascade') {
-    // 级联回读值是多级拼接（如「广东省 / 广州市」），要求每级候选都出现在回读值里
-    const actualNorm = normalize(actual)
-    const parts = expected.split(/\s*[\/>»→\-—、,，]\s*/).filter(Boolean)
-    return parts.length > 0 && parts.every(part => actualNorm.includes(normalize(part)))
+  if (['select', 'radio', 'combobox', 'cascade'].includes(kind)) {
+    const parts = kind === 'radio' ? [] : splitCascadeValue(expected)
+    if (parts.length > 1) {
+      const actualParts = splitCascadeValue(actual)
+      return parts.every(part => actualParts.some(item => optionEquivalent(item, part)) || optionEquivalent(actual, part))
+    }
+    return optionEquivalent(actual, expected)
   }
   if (['multiselect', 'checkbox'].includes(kind)) {
     const requested = expected.split(/[,，、|/]/).map(item => item.trim()).filter(Boolean)
@@ -64,6 +82,10 @@ export function valuesEquivalent(ref: FieldRef, actual: string, expected: string
     if (requested.length <= 1) return optionEquivalent(actual, expected)
     return requested.every(item => actualParts.some(part => optionEquivalent(part, item)))
   }
+  const digits = (text: string) => text.replace(/\D/g, '')
+  const actualDigits = digits(actual)
+  const expectedDigits = digits(expected)
+  if (actualDigits.length >= 11 && actualDigits === expectedDigits) return true
   return normalize(actual) === normalize(expected)
 }
 
@@ -126,6 +148,9 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
   if (!ref || !ref.element.isConnected) {
     return fail(request, 'element-lost', '页面上找不到该字段（可能已重渲染），请重新识别', attempts, startedAt)
   }
+  if (ref.kind === 'file') {
+    return fail(request, 'unsupported-control', '附件需要你在网页上手动选择，插件不会代为上传', attempts, startedAt)
+  }
   const recognizer = resolveRecognizer(ref)
   if (!recognizer) {
     return fail(request, 'unsupported-control', '暂不支持该控件类型', attempts, startedAt)
@@ -138,7 +163,9 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
     return fail(request, 'readonly', '字段为只读或禁用状态', attempts, startedAt)
   }
   const previous = readCurrentValue(ref)
-  if (previous.trim() && !request.overwrite) {
+  // 自动填写永远以页面现值为准。即使扫描时字段还是空的，只要用户在真正
+  // 写入前已经填过，也在这里实时回读并跳过。只有明确的手动操作可以覆盖。
+  if (previous.trim() && request.intent !== 'manual') {
     return {
       result: {
         fieldId: request.fieldId, status: 'skipped', message: '页面已有内容，保留原值',
@@ -161,7 +188,7 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
   }
 
   // APPLY + SETTLE + RETRY
-  const candidates = [request.value, ...expandCandidates(request.value).slice(0, MAX_SYNONYM_RETRIES)]
+  const candidates = fillCandidates(request)
   let reopenBudget = MAX_REOPEN_RETRIES
   let rerenderBudget = 1
   let lastReason: NonNullable<FillResult['reasonCode']> = 'timeout'
@@ -220,13 +247,51 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
 
   const messages: Record<string, string> = {
     'no-matching-option': `选项集中没有可匹配的值${lastDetail ? `（${lastDetail}）` : ''}`,
-    'option-list-not-found': '无法定位该控件的选项浮层',
+    'option-list-not-found': `无法定位该控件的选项浮层${lastDetail ? `（${lastDetail}）` : ''}`,
     'cleared-by-rerender': '填写结果被页面重渲染清空',
     'rejected-by-validation': '页面校验拒绝了该值',
     'unsupported-control': '暂不支持该控件类型',
     timeout: `网页未保留填写结果${lastDetail ? `（${lastDetail}）` : ''}`
   }
   return fail(request, lastReason, messages[lastReason] || '填写失败', attempts, startedAt)
+}
+
+/** 原生下拉还只有占位项时，先写别的字段，等选项出来再写它。 */
+export function selectWaitingForOptions(element: HTMLElement): boolean {
+  if (!(element instanceof HTMLSelectElement) || element.multiple) return false
+  return !Array.from(element.options).some(option => {
+    const text = option.text.trim()
+    return Boolean(text) && !option.disabled && !isPlaceholderOption(text)
+  })
+}
+
+function optionsNotReady(result: FillResult): boolean {
+  return result.reasonCode === 'option-list-not-found' && (result.message || '').includes('选项尚未出现')
+}
+
+/**
+ * 已有真实选项的字段先写。选项仍是占位符的先跳过，写完其它字段后再试一次。
+ * 不按省市区或其它标签排序。
+ */
+export async function executeFillSequence(values: FillRequest[], locate: (fieldId: string) => FieldRef | undefined): Promise<FillExecution[]> {
+  const done: FillExecution[] = []
+  const later: FillRequest[] = []
+  for (const request of values) {
+    const ref = locate(request.fieldId)
+    if (ref && selectWaitingForOptions(ref.element)) {
+      later.push(request)
+      continue
+    }
+    const execution = await executeFill(request, () => locate(request.fieldId))
+    if (optionsNotReady(execution.result)) later.push(request)
+    else done.push(execution)
+  }
+  for (const request of later) {
+    const ref = locate(request.fieldId)
+    if (ref?.element instanceof HTMLSelectElement) await pollUntil(() => !selectWaitingForOptions(ref.element), 1500)
+    done.push(await executeFill(request, () => locate(request.fieldId)))
+  }
+  return done
 }
 
 /** 撤销单条记录（F52）。返回 null 表示成功，否则返回无法恢复的原因。 */

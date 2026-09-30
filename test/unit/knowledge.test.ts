@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { Fact, FormField } from '../../src/domain/types'
+import type { LearnedAlias } from '../../src/domain/types'
 import {
   canonicalGroupName, canonicalizeFact, canonicalizeFacts,
-  classifyPageInput, mergeIntoKnowledge
+  classifyPageInput, foldProfileFacts, mergeIntoKnowledge
 } from '../../src/features/rag/knowledge'
 
 function makeFact(partial: Partial<Fact>): Fact {
@@ -21,7 +22,8 @@ describe('canonicalGroupName（分组归一）', () => {
   it('变体分组名归一到规范板块名', () => {
     expect(canonicalGroupName('教育背景')).toBe('教育经历')
     expect(canonicalGroupName('社会实践 · 校内活动')).toBe('社会实践 / 校内活动')
-    expect(canonicalGroupName('工作经历')).toBe('实习经历')
+    expect(canonicalGroupName('工作经历')).toBe('工作经历')
+    expect(canonicalGroupName('实习经历')).toBe('实习经历')
   })
   it('无法识别时原样返回，空值归入其他', () => {
     expect(canonicalGroupName('特殊板块')).toBe('特殊板块')
@@ -66,6 +68,11 @@ describe('classifyPageInput（网页学习分类）', () => {
     expect(entry?.fact.group).toBe('基本信息')
     expect(entry?.fact.key).toBe('内部推荐人工号')
   })
+  it('英文标识符和基本信息的段号不入库成多段自定义字段', () => {
+    expect(classifyPageInput(makeField({ label: 'basicSex', sectionId: 'personal', item: 4 }), '男')).toBeNull()
+    const entry = classifyPageInput(makeField({ label: '内推人工号', sectionId: 'personal', item: 12 }), 'E1')
+    expect(entry?.fact.item).toBe(1)
+  })
   it('空值 / 无标签的输入不入库', () => {
     expect(classifyPageInput(makeField({ label: '某字段' }), '   ')).toBeNull()
     expect(classifyPageInput(makeField({ label: '' }), '有值')).toBeNull()
@@ -79,6 +86,26 @@ describe('classifyPageInput（网页学习分类）', () => {
     expect(entry?.fact.group).toBe('实习经历')
     expect(entry?.fact.key).toBe('开始时间')
     expect(entry?.fact.item).toBe(2)
+  })
+  it('没有槽位但标签是内置别名时，归到规范名，不另存字段', () => {
+    const entry = classifyPageInput(makeField({ label: '名字', sectionId: 'personal' }), '李四')
+    expect(entry?.custom).toBe(false)
+    expect(entry?.slot).toBe('personal.name')
+    expect(entry?.fact.key).toBe('姓名')
+    expect(entry?.fieldLabel).toBe('名字')
+  })
+  it('标签对不上任何别名时，仍按原标签保存为自定义字段', () => {
+    const entry = classifyPageInput(makeField({ label: '您的姓名', sectionId: 'personal' }), '王五')
+    expect(entry?.custom).toBe(true)
+    expect(entry?.slot).toBeUndefined()
+    expect(entry?.fact.key).toBe('您的姓名')
+  })
+  it('已学别名在扫描没给槽位时也能归到原槽位', () => {
+    const learned: LearnedAlias[] = [{ alias: '您的姓名', slot: 'personal.name', hitCount: 1, updatedAt: '' }]
+    const entry = classifyPageInput(makeField({ label: '您的姓名', sectionId: 'personal' }), '王五', learned)
+    expect(entry?.custom).toBe(false)
+    expect(entry?.slot).toBe('personal.name')
+    expect(entry?.fact.key).toBe('姓名')
   })
   it('本板块没有同名槽位时，记成该板块的自定义字段，不写进别的板块', () => {
     const field = makeField({
@@ -121,5 +148,27 @@ describe('mergeIntoKnowledge（知识库合并）', () => {
     expect(result.facts[0].id).toBe('award-1')
     expect(result.facts[0].group).toBe('奖励荣誉')
     expect(result.facts[0].value).toBe('2021-09')
+  })
+  it('名字并入姓名，不新增一条', () => {
+    const existing = [makeFact({ id: 'keep-1', key: '姓名', value: '张三' })]
+    const result = mergeIntoKnowledge(existing, [
+      makeFact({ key: '名字', value: '李四' })
+    ])
+    expect(result.updated).toBe(1)
+    expect(result.added).toBe(0)
+    expect(result.facts).toHaveLength(1)
+    expect(result.facts[0].id).toBe('keep-1')
+    expect(result.facts[0].key).toBe('姓名')
+    expect(result.facts[0].value).toBe('李四')
+  })
+  it('同一槽位的旧别名在折叠时合成一条规范名', () => {
+    const folded = foldProfileFacts([
+      makeFact({ id: 'name', key: '姓名', value: '张三', updatedAt: '2024-01-01T00:00:00.000Z' }),
+      makeFact({ id: 'alias', key: '名字', value: '李四', updatedAt: '2024-06-01T00:00:00.000Z' })
+    ])
+    expect(folded).toHaveLength(1)
+    expect(folded[0].id).toBe('name')
+    expect(folded[0].key).toBe('姓名')
+    expect(folded[0].value).toBe('李四')
   })
 })

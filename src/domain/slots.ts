@@ -6,7 +6,7 @@
  */
 
 export type SectionId =
-  | 'personal' | 'education' | 'intention' | 'project' | 'internship'
+  | 'personal' | 'education' | 'intention' | 'project' | 'work' | 'internship'
   | 'campus' | 'award' | 'certificate' | 'skill' | 'family' | 'summary' | 'other'
 
 export type SlotValueType =

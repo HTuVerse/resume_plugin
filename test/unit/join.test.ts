@@ -32,6 +32,25 @@ describe('gateValue（F04 硬闸门）', () => {
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reasonCode).toBe('no-matching-option')
   })
+  it('组件下拉有选项集时和原生 select 一样拒绝对不上的值', () => {
+    const field = makeField({ kind: 'combobox', options: ['本科', '硕士'] })
+    const result = gateValue(slotById('education.degree'), field, '博士')
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reasonCode).toBe('no-matching-option')
+  })
+  it('多选按选项逐个校验', () => {
+    const field = makeField({ kind: 'multiselect', options: ['英语', '日语'] })
+    const result = gateValue(undefined, field, '英语、韩语')
+    expect(result.ok).toBe(false)
+  })
+  it('选择类控件读不到两个真实选项时待确认，不自动填写', () => {
+    const empty = gateValue(slotById('personal.gender'), makeField({ kind: 'combobox', options: [] }), '男')
+    expect(empty.ok).toBe(true)
+    if (empty.ok) expect(empty.needsConfirmation).toBe(true)
+    const placeholder = gateValue(slotById('education.degree'), makeField({ kind: 'select', options: ['请选择'] }), '本科')
+    expect(placeholder.ok).toBe(true)
+    if (placeholder.ok) expect(placeholder.needsConfirmation).toBe(true)
+  })
   it('全等命中直接通过，不需确认', () => {
     const field = makeField({ kind: 'radio', options: ['男', '女'] })
     const result = gateValue(slotById('personal.gender'), field, '男')

@@ -7,13 +7,16 @@ import {
   loadAiSettings, loadCurrentResume, loadProfile, loadResumeLibrary, loadTemplates, restoreBackup,
   saveAiSettings, saveCurrentResume, saveProfile, saveResumeLibrary, saveTemplates
 } from '../../infrastructure/storage/store'
-import type { AiSettings, BackupPayload, CurrentResume, Fact, ResumeTemplate, SiteRule } from '../../domain/types'
+import type { AiSettings, BackupPayload, CurrentResume, Fact, LearnedAlias, ResumeTemplate, SiteRule } from '../../domain/types'
 import { beginPanelDrag } from '../bridge/panelBridge'
 import { mergeFactsByPriority } from '../../features/autofill/factPriority'
+import { factToSlot } from '../../features/autofill/match/factToSlot'
 import { canonicalGroupName } from '../../features/rag/knowledge'
-import { importRules, loadSiteRules, removeRule, setRuleDisabled } from '../../features/siteRules/ruleStore'
+import { clearRuleLabelScope, importRules, loadSiteRules, removeRule, setRuleDisabled } from '../../features/siteRules/ruleStore'
+import { loadLearnedAliases, removeLearnedAlias, setAliasDisabled } from '../../features/ontology/learnedAliases'
 import { slotById } from '../../features/ontology/slotRegistry'
 import { sectionLabel } from '../../features/ontology/sections'
+import type { SectionId } from '../../domain/slots'
 import { clearLicense, licenseExpiryLabel, loadLicense, type LicenseRecord } from '../../features/license/license'
 
 type ViewName = 'home' | 'resume' | 'profile' | 'assist' | 'settings'
@@ -22,11 +25,21 @@ type ProfileSection = { id: string; label: string; group: string; aliases: strin
 const LEGACY_FIELD_KEYS: Record<string, string[]> = {
   预计毕业时间: ['毕业时间', '毕业日期', '毕业年月']
 }
+function samePresetSlot(group: string, left: string, right: string): boolean {
+  const slot = factToSlot({ group, key: left, item: 1 }).slot
+  return Boolean(slot) && slot === factToSlot({ group, key: right, item: 1 }).slot
+}
 function factForProfileField(rows: Fact[], key: string): Fact | undefined {
-  return rows.find(fact => fact.key === key) || rows.find(fact => LEGACY_FIELD_KEYS[key]?.includes(fact.key))
+  const exact = rows.find(fact => fact.key === key) || rows.find(fact => LEGACY_FIELD_KEYS[key]?.includes(fact.key))
+  if (exact) return exact
+  const group = rows[0]?.group || ''
+  if (!group) return undefined
+  const aliased = rows.filter(fact => samePresetSlot(group, fact.key, key))
+  return aliased.find(fact => fact.value.trim()) || aliased[0]
 }
 function isPresetFieldKey(section: ProfileSection, key: string): boolean {
-  return section.fields.includes(key) || section.fields.some(field => LEGACY_FIELD_KEYS[field]?.includes(key))
+  if (section.fields.includes(key) || section.fields.some(field => LEGACY_FIELD_KEYS[field]?.includes(key))) return true
+  return section.fields.some(field => samePresetSlot(section.group, key, field))
 }
 
 const props = withDefaults(defineProps<{ embedded?: boolean; initialView?: ViewName }>(), { embedded: false, initialView: 'home' })
@@ -56,6 +69,7 @@ const profileEditing = ref(false)
 const profileEditRows = ref<Array<Fact & { custom?: boolean }>>([])
 const features = reactive<FeatureSettings>({ autoHighlight: true, autoClipboard: true, aiMapping: true, debugMode: false, miniPanel: true, aiMatchThreshold: 85 })
 const siteRules = ref<SiteRule[]>([])
+const learnedAliases = ref<LearnedAlias[]>([])
 const license = ref<LicenseRecord | null>(null)
 const ruleFile = ref<File | null>(null)
 const rulesByDomain = computed(() => {
@@ -77,7 +91,8 @@ const profileSections: ProfileSection[] = [
   { id: 'education', label: '教育经历', group: '教育经历', aliases: ['教育经历', '教育背景'], repeatable: true, fields: ['入学时间', '毕业时间', '学校名称', '学历', '学位', '学制', '受教育类型', '院系', '专业名称', '专业课程'] },
   { id: 'intention', label: '求职意向', group: '求职意向', aliases: ['求职意向'], repeatable: false, fields: ['期望工作地点', '期望薪酬', '到岗时间', '期望工作性质', '了解该招聘信息渠道'] },
   { id: 'project', label: '项目经验', group: '项目经验', aliases: ['项目经验', '项目经历'], repeatable: true, fields: ['开始时间', '结束时间', '项目名称', '项目职务', '项目描述'] },
-  { id: 'internship', label: '实习经历', group: '实习经历', aliases: ['实习经历', '工作经历'], repeatable: true, fields: ['开始时间', '结束时间', '企业名称', '职位名称', '证明人姓名', '证明人职务', '证明人联系方式', '工作描述'] },
+  { id: 'work', label: '工作经历', group: '工作经历', aliases: ['工作经历', '职业经历', '任职经历'], repeatable: true, fields: ['开始时间', '结束时间', '企业名称', '职位名称', '工作描述'] },
+  { id: 'internship', label: '实习经历', group: '实习经历', aliases: ['实习经历'], repeatable: true, fields: ['开始时间', '结束时间', '企业名称', '职位名称', '证明人姓名', '证明人职务', '证明人联系方式', '工作描述'] },
   { id: 'campus', label: '社会实践 / 校内活动', group: '社会实践 / 校内活动', aliases: ['社会实践 / 校内活动', '社会实践', '校内活动'], repeatable: true, fields: ['开始时间', '结束时间', '活动名称', '活动描述', '职务'] },
   { id: 'awards', label: '在校获奖荣誉', group: '在校获奖荣誉', aliases: ['在校获奖荣誉', '奖励荣誉', '荣誉奖励', '获奖'], repeatable: true, fields: ['奖项类别', '奖励名称', '奖励级别', '奖励等级', '获奖时间', '颁发单位'] },
   { id: 'certificates', label: '证书', group: '证书', aliases: ['证书', '资格证书', '技能证书'], repeatable: true, fields: ['证书名称', '证书等级', '获得时间', '发证机构', '证书编号'] },
@@ -165,6 +180,7 @@ onMounted(async () => {
   if (stored.featureSettingsV1) Object.assign(features, stored.featureSettingsV1)
   features.aiMatchThreshold = Math.min(100, Math.max(0, Number(features.aiMatchThreshold) || 85))
   siteRules.value = await loadSiteRules()
+  learnedAliases.value = await loadLearnedAliases()
   license.value = await loadLicense()
   if (!props.embedded) {
     const requested = new URLSearchParams(location.search).get('view') as ViewName | null
@@ -207,6 +223,9 @@ function ruleSlotName(slot: string): string {
   const def = slotById(slot)
   return def ? `${sectionLabel(def.section)} · ${def.aliases[0]}` : slot
 }
+function ruleSectionName(sectionId?: string): string {
+  return sectionId ? sectionLabel(sectionId as SectionId) : ''
+}
 async function toggleRule(rule: SiteRule) {
   await setRuleDisabled(rule.id, !rule.disabled)
   siteRules.value = await loadSiteRules()
@@ -215,6 +234,21 @@ async function deleteRule(rule: SiteRule) {
   await removeRule(rule.id)
   siteRules.value = await loadSiteRules()
   message.value = '站点规则已删除。'
+}
+async function limitRuleToFingerprint(rule: SiteRule) {
+  await clearRuleLabelScope(rule.id)
+  siteRules.value = await loadSiteRules()
+  message.value = '这条规则现在只匹配原来的那一个字段。'
+}
+async function toggleAlias(alias: LearnedAlias) {
+  await setAliasDisabled(alias.alias, alias.sectionId, !alias.disabled)
+  learnedAliases.value = await loadLearnedAliases()
+  message.value = alias.disabled ? '这条字段别名已重新启用。' : '这条字段别名已停用。'
+}
+async function deleteAlias(alias: LearnedAlias) {
+  await removeLearnedAlias(alias.alias, alias.sectionId)
+  learnedAliases.value = await loadLearnedAliases()
+  message.value = '已删除这条字段别名。'
 }
 async function exportRules() {
   const payload = JSON.stringify(siteRules.value, null, 2)
@@ -442,7 +476,7 @@ async function clearProfileOnly() {
 }
 async function clearAll() {
   if (!confirm('确定清理插件中的简历、个人信息、模板和 AI 配置吗？此操作不可恢复。')) return
-  await clearAllLocalData(); facts.value = []; templates.value = []; resumes.value = []; currentResume.value = null; siteRules.value = []
+  await clearAllLocalData(); facts.value = []; templates.value = []; resumes.value = []; currentResume.value = null; siteRules.value = []; learnedAliases.value = []
   Object.assign(aiSettings, { url: 'https://api.openai.com/v1', key: '', model: 'gpt-4o-mini' }); message.value = '全部本地数据已清理。'
 }
 async function createTemplate() {
@@ -492,7 +526,7 @@ async function importBackup() {
   busy.value = true
   try {
     const payload = JSON.parse(await backupFile.value.text()) as BackupPayload; await restoreBackup(payload)
-    facts.value = (await loadProfile()).facts; currentResume.value = await loadCurrentResume(); resumes.value = await loadResumeLibrary(); templates.value = await loadTemplates(); Object.assign(aiSettings, await loadAiSettings()); message.value = '备份已恢复。'
+    facts.value = (await loadProfile()).facts; currentResume.value = await loadCurrentResume(); resumes.value = await loadResumeLibrary(); templates.value = await loadTemplates(); Object.assign(aiSettings, await loadAiSettings()); siteRules.value = await loadSiteRules(); learnedAliases.value = await loadLearnedAliases(); message.value = '备份已恢复。'
   } catch (error) { message.value = error instanceof Error ? error.message : '备份恢复失败。' }
   finally { busy.value = false }
 }
@@ -621,7 +655,7 @@ async function importBackup() {
       <section class="content-card settings-card"><div class="card-heading"><div class="title-with-icon"><span class="settings-icon blue">⚙</span><div><h2>功能设置</h2><p>自定义 AI 助手的行为和功能。</p></div></div></div><label class="toggle-row"><span><b>自动高亮填写字段</b><small>在支持的表单上标记已填写字段</small></span><input v-model="features.autoHighlight" type="checkbox" @change="saveFeatureSettings" /></label><label class="toggle-row"><span><b>自动复制到剪贴板</b><small>中心字段填入后保留一份内容用于手动粘贴</small></span><input v-model="features.autoClipboard" type="checkbox" @change="saveFeatureSettings" /></label><label class="toggle-row"><span><b>启用 AI 字段映射</b><small>智能匹配网页字段和你的简历内容</small></span><input v-model="features.aiMapping" type="checkbox" @change="saveFeatureSettings" /></label><label class="threshold-row"><span><b>AI 自动填写匹配阈值</b><small>高于阈值正常高亮；低于阈值使用差异色并等待确认</small></span><div><input v-model.number="features.aiMatchThreshold" type="number" min="0" max="100" step="1" @change="saveFeatureSettings" /><em>%</em></div></label><label class="toggle-row"><span><b>调试模式</b><small>显示详细日志信息，仅用于排查问题</small></span><input v-model="features.debugMode" type="checkbox" @change="saveFeatureSettings" /></label><label class="toggle-row"><span><b>默认显示缩小态</b><small>打开插件时优先显示缩小态悬浮面板</small></span><input v-model="features.miniPanel" type="checkbox" @change="saveFeatureSettings" /></label></section>
       <section class="content-card settings-card">
         <div class="card-heading">
-          <div class="title-with-icon"><span class="settings-icon blue">⛁</span><div><h2>站点规则（{{ siteRules.length }}）</h2><p>手工修正字段匹配后自动学习，下次同站优先命中。规则只记录「字段 → 语义」，不含个人数据。</p></div></div>
+          <div class="title-with-icon"><span class="settings-icon blue">⛁</span><div><h2>站点规则（{{ siteRules.length }}）</h2><p>手工修正后，同站相同标签会按这个槽位识别。可以改回只认原来那一个字段。规则不含个人数据。</p></div></div>
         </div>
         <div class="setting-actions">
           <button class="subtle-button" :disabled="!siteRules.length" @click="exportRules">导出规则包</button>
@@ -634,12 +668,28 @@ async function importBackup() {
           <div v-for="rule in group.rules" :key="rule.id" class="resume-row">
             <div>
               <b>{{ ruleSlotName(rule.slot) }}</b>
-              <span>指纹 {{ rule.fieldFingerprint.slice(0, 24) }} · 命中 {{ rule.hitCount }} 次 · 失败 {{ rule.failCount }} 次 · {{ rule.origin === 'user-correction' ? '用户修正' : rule.origin === 'imported' ? '导入' : '内置' }}</span>
+              <span>{{ rule.labelKey ? `同类标签「${rule.labelKey}」` : `指纹 ${rule.fieldFingerprint.slice(0, 24)}` }}{{ ruleSectionName(rule.sectionId) ? ` · ${ruleSectionName(rule.sectionId)}` : '' }} · 命中 {{ rule.hitCount }} 次 · 失败 {{ rule.failCount }} 次 · {{ rule.origin === 'user-correction' ? '用户修正' : rule.origin === 'ai' ? 'AI 确认' : rule.origin === 'fill' ? '填写成功' : rule.origin === 'imported' ? '导入' : '内置' }}</span>
             </div>
             <span v-if="rule.disabled" class="current-pill">已停用{{ rule.failCount >= 3 ? '（疑似失效）' : '' }}</span>
+            <button v-if="rule.labelKey" class="subtle-button" @click="limitRuleToFingerprint(rule)">仅此字段</button>
             <button class="subtle-button" @click="toggleRule(rule)">{{ rule.disabled ? '启用' : '停用' }}</button>
             <button class="danger-link" @click="deleteRule(rule)">删除</button>
           </div>
+        </div>
+      </section>
+      <section class="content-card settings-card">
+        <div class="card-heading">
+          <div class="title-with-icon"><span class="settings-icon violet">Aa</span><div><h2>学到的字段别名（{{ learnedAliases.length }}）</h2><p>确认过的措辞下次按这个槽位识别。开始时间这类多个板块都有的标签，只在学到它的那个板块里生效。</p></div></div>
+        </div>
+        <div v-if="!learnedAliases.length" class="empty-state">还没有学到别名。在填写面板里改选字段后，这里会记下标签和槽位。</div>
+        <div v-for="alias in learnedAliases" :key="(alias.sectionId || '') + alias.alias" class="resume-row">
+          <div>
+            <b>{{ alias.alias }}</b>
+            <span>→ {{ ruleSlotName(alias.slot) }}{{ ruleSectionName(alias.sectionId) ? ` · 仅${ruleSectionName(alias.sectionId)}` : '' }} · 命中 {{ alias.hitCount }} 次 · 失败 {{ alias.failCount || 0 }} 次</span>
+          </div>
+          <span v-if="alias.disabled" class="current-pill">已停用（疑似失效）</span>
+          <button class="subtle-button" @click="toggleAlias(alias)">{{ alias.disabled ? '启用' : '停用' }}</button>
+          <button class="danger-link" @click="deleteAlias(alias)">删除</button>
         </div>
       </section>
       <section class="content-card settings-card"><div class="card-heading"><div class="title-with-icon"><span class="settings-icon cyan">▣</span><div><h2>数据管理</h2><p>管理本地存储的简历和个人信息。</p></div></div></div><div class="data-grid"><div><b>档案表格</b><label class="check-row"><input v-model="redactTable" type="checkbox" /> 导出时脱敏</label><div><button @click="exportTable('xlsx')">导出 Excel</button><button @click="exportTable('csv')">导出 CSV</button></div><label class="file-button">导入表格<input type="file" accept=".xlsx,.xls,.csv" @change="tableFile = ($event.target as HTMLInputElement).files?.[0] || null" /></label><button :disabled="!tableFile || busy" @click="importTable">确认导入</button></div><div><b>完整备份</b><label class="check-row"><input v-model="redactBackup" type="checkbox" /> 脱敏个人字段</label><div><button @click="exportBackup">导出备份</button></div><label class="file-button">选择备份<input type="file" accept=".json" @change="backupFile = ($event.target as HTMLInputElement).files?.[0] || null" /></label><button :disabled="!backupFile || busy" @click="importBackup">恢复备份</button></div></div><div class="danger-zone"><span><b>清除所有数据</b><small>删除当前浏览器中的个人信息、简历、模板和 AI 配置。</small></span><button @click="clearAll">清除所有数据</button></div></section>

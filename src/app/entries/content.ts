@@ -1,12 +1,16 @@
 import type { FillRequest, FillResult, FormField } from '../../domain/types'
-import { choiceGroupOf, readClickedChoice, readCurrentValue, scanPage, type FieldRef } from '../../features/autofill/scan/collector'
+import { choiceGroupOf, choiceObserveRoots, eventElement, looksLikeChoice, readClickedChoice, readCurrentValue, scanPage, type FieldRef } from '../../features/autofill/scan/collector'
 import { visibleChoiceText } from '../../features/autofill/scan/labelResolver'
-import { isElementVisible } from '../../features/autofill/write/domUtils'
+import { clickAddForSection, clickAddNear } from '../../features/autofill/scan/repeatGroups'
+import { isElementVisible, pollUntil } from '../../features/autofill/write/domUtils'
+import { normalize } from '../../shared/normalize'
 import { isPlaceholderOption } from '../../features/ontology/optionMatch'
 import { scoreFieldSlots, decideSlot } from '../../features/autofill/match/fieldToSlot'
-import { executeFill, undoRecord, type UndoRecord } from '../../features/autofill/write/writeMachine'
+import { executeFillSequence, undoRecord, type UndoRecord } from '../../features/autofill/write/writeMachine'
+import { loadFillRecipes, priorValuesFor, recipeFor, rememberSuccessfulFill } from '../../features/autofill/write/fillRecipes'
 import { loadLearnedAliases } from '../../features/ontology/learnedAliases'
-import { loadSiteRules, rulesForDomain } from '../../features/siteRules/ruleStore'
+import { probeEmptyChoiceOptions } from '../../features/autofill/scan/probeOptions'
+import { findSiteRule, loadSiteRules, rulesForDomain } from '../../features/siteRules/ruleStore'
 import { LICENSE_REQUIRED_MESSAGE, loadLicense } from '../../features/license/license'
 
 /**
@@ -173,10 +177,18 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (!(target instanceof HTMLElement)) return undefined
     const found = matchRef(target, refs)
     if (found) return found
-    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement)) return undefined
+    const nativeField = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+    if (!nativeField && !looksLikeChoice(target)) return undefined
     const output = scanPage()
     refs = output.refs
+    watchLearnedInputs()
     return matchRef(target, refs)
+  }
+
+  function clickedElement(event: Event): HTMLElement | null {
+    const target = eventElement(event)
+    if (!target || target.closest('[data-resume-assistant]')) return null
+    return target
   }
 
   /** 弹层挂在 body 上时，用当前展开的下拉或日期控件认回字段。 */
@@ -201,8 +213,8 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (fieldWatchInstalled) return
     fieldWatchInstalled = true
     const rememberActive = (event: Event) => {
-      const target = event.target
-      if (!(target instanceof HTMLElement) || target.closest('[data-resume-assistant]')) return
+      const target = clickedElement(event)
+      if (!target) return
       const picked = pickedOptionText(target)
       if (picked) {
         const owner = openedChoice() || activeLearn
@@ -222,8 +234,8 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       }
     }
     const onEdit = (event: Event) => {
-      const target = event.target
-      if (!(target instanceof HTMLElement) || target.closest('[data-resume-assistant]')) return
+      const target = clickedElement(event)
+      if (!target) return
       const picked = pickedOptionText(target)
       const popup = target.closest(POPUP_SELECTOR)
       if (popup || picked) {
@@ -270,6 +282,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     ])
     const output = scanPage()
     refs = output.refs
+    await probeEmptyChoiceOptions(output.fields, refs).catch(() => undefined)
     hasScanned = true
     lastFingerprints = new Set(output.fields.map(field => field.fingerprint))
     for (const field of output.fields) {
@@ -278,8 +291,9 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       field.slotCandidates = decision.candidates
       field.slotStatus = decision.status
       field.slot = decision.slot
-      if (decision.candidates[0]?.locked) {
-        field.ruleId = rules.find(rule => rule.fieldFingerprint === field.fingerprint && !rule.disabled)?.id
+      if (decision.candidates[0]?.signals.learnedAlias) field.learnedAlias = normalize(field.label)
+      if (decision.candidates[0]?.signals.siteRule) {
+        field.ruleId = findSiteRule(rules, field)?.id
       }
     }
     if (featureSettings.debugMode) console.debug('[鸿途网申助手] scan', { frame: IS_COORDINATOR ? 'top' : 'worker', fields: output.fields })
@@ -310,10 +324,19 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     learnObservers = []
     for (const [fingerprint, ref] of refs) {
       if (!CHOICE_KINDS.has(ref.kind)) continue
-      const widget = (ref.element.closest(WATCH_WIDGET) || choiceGroupOf(ref)) as HTMLElement | null
-      const observer = new MutationObserver(() => scheduleLearn(fingerprint, ref))
-      observer.observe(widget || ref.element, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['class', 'title', 'value', 'checked', 'aria-checked', 'aria-selected'] })
-      learnObservers.push(observer)
+      const widget = ref.element.closest(WATCH_WIDGET) as HTMLElement | null
+      const hosts = new Set<HTMLElement>()
+      if (widget) hosts.add(widget)
+      for (const shell of choiceObserveRoots(ref)) {
+        if (widget?.contains(shell)) continue
+        hosts.add(shell)
+      }
+      if (!hosts.size) hosts.add(choiceGroupOf(ref) || ref.element)
+      for (const host of hosts) {
+        const observer = new MutationObserver(() => scheduleLearn(fingerprint, ref))
+        observer.observe(host, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['class', 'title', 'value', 'checked', 'aria-checked', 'aria-selected'] })
+        learnObservers.push(observer)
+      }
     }
   }
 
@@ -321,12 +344,21 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     learnPaused = true
     try {
       if (resetUndo) undoStack = []
+      const recipes = await loadFillRecipes(location.hostname).catch(() => [])
+      const prepared = values.map(request => ({
+        ...request,
+        priorValues: priorValuesFor(recipeFor(recipes, request.slot), request.value)
+      }))
       const results: FillResult[] = []
-      for (const request of values) {
-        const execution = await executeFill(request, () => locateRef(request.fieldId))
+      const executions = await executeFillSequence(prepared, fieldId => locateRef(fieldId))
+      for (const execution of executions) {
         if (execution.result.status === 'filled' && execution.undo) {
           undoStack.push(execution.undo)
           highlight(execution.undo.ref, execution.result)
+          const request = values.find(item => item.fieldId === execution.result.fieldId)
+          if (request?.slot && execution.result.value) {
+            rememberSuccessfulFill(location.hostname, request.slot, request.value, execution.result.value).catch(() => undefined)
+          }
         }
         results.push(execution.result)
       }
@@ -430,7 +462,35 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       .catch(error => respond({ error: String(error) }))
   }
 
-  chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number }, _sender, respond) => {
+  async function frameExpand(demands: Array<{ section: string; missing: number }>): Promise<{ clicked: Array<{ section: string; count: number }> }> {
+    const clicked: Array<{ section: string; count: number }> = []
+    for (const demand of demands) {
+      const times = Math.max(0, Math.min(8, demand.missing || 0))
+      let count = 0
+      for (let index = 0; index < times; index += 1) {
+        const output = scanPage()
+        const grouped = output.fields.filter(item => item.sectionId === demand.section && item.repeatGroupId)
+        const elements = grouped
+          .map(field => output.refs.get(field.fingerprint)?.element)
+          .filter((element): element is HTMLElement => Boolean(element))
+        const before = output.fields.length
+        let hit = elements.length ? clickAddForSection(elements) : false
+        if (!hit && !grouped.length) {
+          const field = output.fields.find(item => item.sectionId === demand.section)
+          const ref = field ? output.refs.get(field.fingerprint) : undefined
+          hit = Boolean(ref && clickAddNear(ref.element))
+        }
+        if (!hit) break
+        const grew = await pollUntil(() => scanPage().fields.length > before ? true : null, 800)
+        if (!grew) break
+        count += 1
+      }
+      if (count) clicked.push({ section: demand.section, count })
+    }
+    return { clicked }
+  }
+
+  chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number; demands?: Array<{ section: string; missing: number }> }, _sender, respond) => {
     if (message.type === 'FRAME_SCAN') {
       denyUnlessLicensed(respond, () => {
         frameScan().then(respond).catch(error => respond({ error: String(error) }))
@@ -451,6 +511,12 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     }
     if (message.type === 'FRAME_VALUES') {
       denyUnlessLicensed(respond, () => respond(frameValues()))
+      return true
+    }
+    if (message.type === 'FRAME_EXPAND') {
+      denyUnlessLicensed(respond, () => {
+        frameExpand(message.demands || []).then(respond).catch(error => respond({ error: String(error) }))
+      })
       return true
     }
     if (message.type === 'FRAME_CONFIRM') {
@@ -552,6 +618,23 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     return { values }
   }
 
+  async function aggregateExpand(demands: Array<{ section: string; missing: number }>): Promise<{ clicked: Array<{ section: string; count: number }> }> {
+    const frameIds = await listFrames()
+    const remaining = demands.map(demand => ({ ...demand }))
+    const clicked: Array<{ section: string; count: number }> = []
+    for (const frameId of frameIds) {
+      const pending = remaining.filter(demand => demand.missing > 0)
+      if (!pending.length) break
+      const response = await frameCall<{ clicked?: Array<{ section: string; count: number }> } | null>(frameId, { type: 'FRAME_EXPAND', demands: pending }).catch(() => null)
+      for (const row of response?.clicked || []) {
+        clicked.push(row)
+        const demand = remaining.find(item => item.section === row.section)
+        if (demand) demand.missing = Math.max(0, demand.missing - row.count)
+      }
+    }
+    return { clicked }
+  }
+
   async function aggregateUndo(): Promise<FillResult[]> {
     const frameIds = await listFrames()
     const results: FillResult[] = []
@@ -572,7 +655,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (!(target instanceof HTMLElement)) return undefined
     const control = target instanceof HTMLLabelElement && target.control
       ? target.control
-      : target.closest<HTMLElement>('input,textarea,select,[role="combobox"],[contenteditable="true"]') || target
+      : target.closest<HTMLElement>('input,textarea,select,[role="combobox"],[role="textbox"],[contenteditable="true"]') || target
     for (const entry of refs.entries()) {
       const [, ref] = entry
       if (ref.element === control || ref.element === target || ref.element.contains(control) || ref.element.contains(target)) return entry
@@ -593,7 +676,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (refs.has(fingerprint) || frameId !== 0) {
       const response = await frameCall<{ results?: FillResult[] } | null>(frameId, {
         type: 'FRAME_FILL',
-        values: [{ fieldId: fingerprint, value: message.value, overwrite: true, source: message.source, confidence: message.confidence }],
+        values: [{ fieldId: fingerprint, value: message.value, intent: 'manual', source: message.source, confidence: message.confidence }],
         resetUndo: false
       }).catch(() => null)
       const result = response?.results?.[0]
@@ -601,7 +684,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     }
     // 中心字段快速填写：优先最近聚焦的输入框，否则进入拾取模式
     if (lastFocusedFieldId && refs.get(lastFocusedFieldId)?.element.isConnected) {
-      const results = await frameFill([{ fieldId: lastFocusedFieldId, value: message.value, overwrite: true, source: message.source, confidence: message.confidence }], false)
+      const results = await frameFill([{ fieldId: lastFocusedFieldId, value: message.value, intent: 'manual', source: message.source, confidence: message.confidence }], false)
       return { status: 'filled', copied: message.copied !== false, result: results[0] }
     }
     startPicker(message)
@@ -643,7 +726,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       if (!entry) return
       event.preventDefault()
       event.stopPropagation()
-      const results = await frameFill([{ fieldId: entry[0], value: message.value, overwrite: true, source: message.source, confidence: message.confidence }], false)
+      const results = await frameFill([{ fieldId: entry[0], value: message.value, intent: 'manual', source: message.source, confidence: message.confidence }], false)
       postPanelEvent({ type: 'PICKER_RESULT', copied: message.copied !== false, result: results[0] })
       pickerCleanup?.()
     }
@@ -782,9 +865,10 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   // ─── 面板消息路由（仅 COORDINATOR）──────────────────────────
 
-  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean }): Promise<unknown> {
+  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
     if (!(await loadLicense())) return { error: LICENSE_REQUIRED_MESSAGE }
     if (message.type === 'SCAN') return aggregateScan()
+    if (message.type === 'EXPAND_REPEATS') return aggregateExpand(message.demands || [])
     if (message.type === 'FILL') return aggregateFill(message.values || []).then(results => ({ results }))
     if (message.type === 'UNDO') return aggregateUndo().then(results => ({ results }))
     if (message.type === 'READ_VALUES') return aggregateValues()

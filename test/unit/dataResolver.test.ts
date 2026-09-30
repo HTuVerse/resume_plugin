@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Fact, FormField } from '../../src/domain/types'
-import { buildFactIndex, resolveField } from '../../src/features/autofill/dataResolver'
+import { buildFactIndex, fieldsNeedingAi, resolveField } from '../../src/features/autofill/dataResolver'
 
 function makeFact(partial: Partial<Fact>): Fact {
   return { id: crypto.randomUUID(), group: '基本信息', item: 1, key: '姓名', value: '张三', evidence: '', ...partial }
@@ -66,6 +66,12 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     expect(resolved.value).toBe('李秀兰')
     expect(resolved.factId).toBe('mom')
   })
+  it('页面只有工作经历时，沿用旧档案里记在实习分组的公司', () => {
+    const index = buildFactIndex([makeFact({ group: '实习经历', key: '企业名称', value: '示例公司', item: 1 })], [])
+    const field = makeField({ label: '公司名称', slot: 'work.company', sectionId: 'work', item: 1 })
+    expect(resolveField(field, index).status).toBe('empty')
+    expect(resolveField(field, index, { legacyWorkFallback: true }).value).toBe('示例公司')
+  })
   it('重复段严格按 item 对齐，档案缺该段时留空（防串段）', () => {
     const index = buildFactIndex([makeFact({ group: '教育经历', key: '学校名称', value: '第一大学', item: 1 })], [])
     const second = makeField({ label: '学校名称', slot: 'education.school', item: 2 })
@@ -118,6 +124,39 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     expect(resolved.factId).toBe('name-1')
     expect(resolved.status).toBe('ready')
   })
+  it('二级 AI 可直接匹配知识库自定义字段，不要求预设槽位', () => {
+    const fact = makeFact({ id: 'custom-1', group: '家庭关系', key: '亲属职位', value: '工程师' })
+    const index = buildFactIndex([fact], [])
+    const field = makeField({ label: '亲属任职岗位', group: '家庭关系', sectionId: 'family', item: 1, slotStatus: 'unknown' })
+    const resolved = resolveField(field, index, {
+      aiMatchThreshold: 85,
+      aiSuggestion: { fieldId: 'f1', factId: 'custom-1', confidence: 0.93, reason: '含义一致' }
+    })
+    expect(resolved.status).toBe('ready')
+    expect(resolved.value).toBe('工程师')
+    expect(resolved.factId).toBe('custom-1')
+    expect(resolved.slot).toBeUndefined()
+  })
+  it('二级 AI 直接匹配自定义字段时仍执行置信度阈值', () => {
+    const fact = makeFact({ id: 'custom-low', group: '家庭关系', key: '亲属职位', value: '工程师' })
+    const index = buildFactIndex([fact], [])
+    const field = makeField({ label: '亲属任职岗位', group: '家庭关系', sectionId: 'family', item: 1, slotStatus: 'unknown' })
+    const resolved = resolveField(field, index, {
+      aiMatchThreshold: 85,
+      aiSuggestion: { fieldId: 'f1', factId: 'custom-low', confidence: 0.7, reason: '可能含义一致' }
+    })
+    expect(resolved.status).toBe('needs-confirmation')
+    expect(resolved.source).toBe('ai')
+  })
+  it('二级 AI 直接匹配自定义字段时仍防止重复段串写', () => {
+    const fact = makeFact({ id: 'custom-2', group: '家庭关系', item: 2, key: '亲属职位', value: '教师' })
+    const index = buildFactIndex([fact], [])
+    const field = makeField({ label: '亲属职位', group: '家庭关系', sectionId: 'family', item: 1, slotStatus: 'unknown' })
+    const resolved = resolveField(field, index, {
+      aiSuggestion: { fieldId: 'f1', factId: 'custom-2', confidence: 0.99, reason: '含义一致' }
+    })
+    expect(resolved.status).toBe('empty')
+  })
   it('AI 指定知识库条目：置信度低于阈值 → needs-confirmation', () => {
     const fact = makeFact({ id: 'name-1', key: '名字', value: '张三' })
     const index = buildFactIndex([fact], [])
@@ -140,6 +179,29 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     // 槽位由本地精确命中，AI 只适配了粒度，可以直接填写
     expect(resolved.status).toBe('ready')
   })
+  it('AI 粒度适配值本身经过选项可达性校验', () => {
+    const fact = makeFact({ id: 'origin-1', group: '基本信息', key: '高考生源地', value: '江西吉安永丰' })
+    const index = buildFactIndex([fact], [])
+    const field = makeField({
+      label: '高考生源省份', slot: 'personal.gaokaoOrigin', slotStatus: 'resolved',
+      kind: 'select', options: ['请选择', '江西', '北京']
+    })
+    const resolved = resolveField(field, index, {
+      aiSuggestion: { fieldId: 'f1', slot: 'personal.gaokaoOrigin', factId: 'origin-1', adaptedValue: '江西', confidence: 0.9, reason: '截取到省' }
+    })
+    expect(resolved.status).toBe('ready')
+    expect(resolved.value).toBe('江西')
+  })
+  it('AI 引用的已知知识条目与槽位冲突时拒绝串填', () => {
+    const phone = makeFact({ id: 'phone-1', key: '移动电话', value: '13800138000' })
+    const index = buildFactIndex([phone], [])
+    const field = makeField({ label: '名字', slotStatus: 'unknown' })
+    const resolved = resolveField(field, index, {
+      aiSuggestion: { fieldId: 'f1', slot: 'personal.name', factId: 'phone-1', confidence: 0.99, reason: '错误引用' }
+    })
+    expect(resolved.status).toBe('empty')
+    expect(resolved.value).toBe('')
+  })
   it('自定义字段只做全等匹配，不做子串（R1 教训）', () => {
     const index = buildFactIndex([makeFact({ group: '基本信息', key: '工号', value: 'E12345' })], [])
     const field = makeField({ label: '内部推荐人工号', slotStatus: 'unknown' })
@@ -153,5 +215,18 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     const field = makeField({ label: '入学时间', slot: 'education.startDate', item: 1, sectionId: 'education' })
     expect(resolveField(field, index, { segmentItem: null }).status).toBe('empty')
     expect(resolveField(field, index, { segmentItem: 1 }).value).toBe('2018-09')
+  })
+  it('二级 AI 跳过一级已经 ready 的字段', () => {
+    const ready = makeField({ id: 'ready', label: '姓名', current: '' })
+    const filled = makeField({ id: 'filled', label: '名字', current: '张三' })
+    const missed = makeField({ id: 'missed', label: '您的姓名', current: '' })
+    const pending = fieldsNeedingAi([ready, filled, missed], id => id === 'ready' ? 'ready' : 'empty')
+    expect(pending.map(field => field.id)).toEqual(['missed'])
+  })
+  it('二级 AI 不接管一级已匹配但需要人工确认的字段', () => {
+    const empty = makeField({ id: 'empty' })
+    const needsConfirmation = makeField({ id: 'confirm' })
+    const pending = fieldsNeedingAi([empty, needsConfirmation], id => id === 'confirm' ? 'needs-confirmation' : 'empty')
+    expect(pending.map(field => field.id)).toEqual(['empty'])
   })
 })

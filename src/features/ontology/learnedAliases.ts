@@ -1,4 +1,5 @@
 import type { LearnedAlias } from '../../domain/types'
+import { normalize } from '../../shared/normalize'
 import { slotById } from './slotRegistry'
 
 /**
@@ -13,13 +14,41 @@ import { slotById } from './slotRegistry'
 export const LEARNED_ALIASES_KEY = 'learnedAliasesV1'
 export type { LearnedAlias }
 
+function aliasKey(alias: string, sectionId?: string): string {
+  return `${sectionId || ''}\0${alias}`
+}
+
+function coerceAlias(row: LearnedAlias): LearnedAlias | null {
+  if (!row || typeof row.alias !== 'string' || typeof row.slot !== 'string' || !slotById(row.slot)) return null
+  const alias = normalize(row.alias)
+  if (!alias || row.alias.trim().length > 40) return null
+  const sectionId = typeof row.sectionId === 'string' && row.sectionId ? row.sectionId : undefined
+  return {
+    alias,
+    slot: row.slot,
+    sectionId,
+    hitCount: Number(row.hitCount) || 0,
+    failCount: Number(row.failCount) || 0,
+    disabled: Boolean(row.disabled),
+    updatedAt: typeof row.updatedAt === 'string' ? row.updatedAt : ''
+  }
+}
+
 export async function loadLearnedAliases(): Promise<LearnedAlias[]> {
   const stored = await chrome.storage.local.get(LEARNED_ALIASES_KEY)
   const rows = stored[LEARNED_ALIASES_KEY]
   if (!Array.isArray(rows)) return []
-  return rows.filter((row): row is LearnedAlias => Boolean(row)
-    && typeof row.alias === 'string' && row.alias.trim().length > 0 && row.alias.length <= 40
-    && typeof row.slot === 'string' && Boolean(slotById(row.slot)))
+  const merged = new Map<string, LearnedAlias>()
+  for (const row of rows) {
+    const alias = coerceAlias(row)
+    if (!alias) continue
+    const key = aliasKey(alias.alias, alias.sectionId)
+    const current = merged.get(key)
+    if (!current || alias.hitCount > current.hitCount || (alias.hitCount === current.hitCount && alias.updatedAt > current.updatedAt)) {
+      merged.set(key, alias)
+    }
+  }
+  return [...merged.values()]
 }
 
 export async function saveLearnedAliases(aliases: LearnedAlias[]): Promise<void> {
@@ -27,28 +56,82 @@ export async function saveLearnedAliases(aliases: LearnedAlias[]): Promise<void>
 }
 
 /**
- * 学习一个别名。返回 false 表示无需学习：标签为空、与槽位内置别名重复，
- * 或该标签已被学到其他槽位（冲突时不覆盖，避免一次误选污染全局）。
+ * 学习一个别名。比较前先规范化，所以「姓名：」「*姓名」和「姓名」是同一条。
+ * 返回 skipped 表示无需学习：标签为空、与该槽位内置别名重复。
+ * 返回 conflict 表示该标签已指向其他槽位，且这次不是用户确认覆盖。
+ * overwrite 用于面板里用户改选、确认入库：冲突时改指向，并重新启用。
+ * 命中次数只在填写成功时累加，这里只建立或改指向。
  */
-export async function learnAlias(alias: string, slot: string): Promise<boolean> {
-  const text = alias.trim()
-  if (!text || text.length > 40 || !slotById(slot)) return false
+export type LearnAliasResult = 'saved' | 'unchanged' | 'conflict' | 'skipped'
+
+export async function learnAlias(alias: string, slot: string, options?: { overwrite?: boolean; sectionId?: string }): Promise<LearnAliasResult> {
+  const raw = alias.trim()
+  const text = normalize(raw)
+  const sectionId = options?.sectionId || undefined
+  if (!text || raw.length > 40 || !slotById(slot)) return 'skipped'
   const def = slotById(slot)!
-  if (def.aliases.some(item => item.trim() === text)) return false
+  if (!sectionId && def.aliases.some(item => normalize(item) === text)) return 'skipped'
   const aliases = await loadLearnedAliases()
-  const existing = aliases.find(item => item.alias === text)
+  const existing = aliases.find(item => item.alias === text && (item.sectionId || '') === (sectionId || ''))
+  const now = new Date().toISOString()
   if (existing) {
-    if (existing.slot !== slot) return false
-    existing.hitCount += 1
-    existing.updatedAt = new Date().toISOString()
+    if (existing.slot !== slot) {
+      if (!options?.overwrite) return 'conflict'
+      existing.slot = slot
+      existing.hitCount = 0
+      existing.failCount = 0
+      existing.disabled = false
+    } else if (options?.overwrite && existing.disabled) {
+      existing.disabled = false
+    } else {
+      return 'unchanged'
+    }
+    existing.updatedAt = now
   } else {
-    aliases.push({ alias: text, slot, hitCount: 1, updatedAt: new Date().toISOString() })
+    aliases.push({ alias: text, slot, sectionId, hitCount: 0, failCount: 0, disabled: false, updatedAt: now })
   }
   await saveLearnedAliases(aliases)
-  return true
+  return 'saved'
 }
 
-export async function removeLearnedAlias(alias: string): Promise<void> {
+/** 别名命中且填写成功。 */
+export async function recordAliasHit(alias: string, sectionId?: string): Promise<void> {
+  const key = normalize(alias)
   const aliases = await loadLearnedAliases()
-  await saveLearnedAliases(aliases.filter(item => item.alias !== alias))
+  const row = aliases.find(item => item.alias === key && (!sectionId || item.sectionId === sectionId)) || aliases.find(item => item.alias === key && !item.sectionId)
+  if (!row) return
+  row.hitCount += 1
+  row.updatedAt = new Date().toISOString()
+  await saveLearnedAliases(aliases)
+}
+
+/**
+ * 别名命中后写入仍失败时降权。
+ * failCount ≥ 3 且多于命中次数时停用，避免一次学错的措辞一直锁死。
+ */
+export async function recordAliasFailure(alias: string, sectionId?: string): Promise<void> {
+  const key = normalize(alias)
+  const aliases = await loadLearnedAliases()
+  const row = aliases.find(item => item.alias === key && (!sectionId || item.sectionId === sectionId)) || aliases.find(item => item.alias === key && !item.sectionId)
+  if (!row) return
+  row.failCount = (row.failCount || 0) + 1
+  if (row.failCount >= 3 && row.failCount > row.hitCount) row.disabled = true
+  row.updatedAt = new Date().toISOString()
+  await saveLearnedAliases(aliases)
+}
+
+export async function setAliasDisabled(alias: string, sectionId: string | undefined, disabled: boolean): Promise<void> {
+  const key = normalize(alias)
+  const aliases = await loadLearnedAliases()
+  const row = aliases.find(item => item.alias === key && (item.sectionId || '') === (sectionId || ''))
+  if (!row || row.disabled === disabled) return
+  row.disabled = disabled
+  row.updatedAt = new Date().toISOString()
+  await saveLearnedAliases(aliases)
+}
+
+export async function removeLearnedAlias(alias: string, sectionId?: string): Promise<void> {
+  const key = normalize(alias)
+  const aliases = await loadLearnedAliases()
+  await saveLearnedAliases(aliases.filter(item => !(item.alias === key && (item.sectionId || '') === (sectionId || ''))))
 }

@@ -1,5 +1,6 @@
 import type { SiteRule } from '../../domain/types'
-import { slotById } from '../ontology/slotRegistry'
+import { normalize } from '../../shared/normalize'
+import { aliasSectionCount, slotById } from '../ontology/slotRegistry'
 
 /**
  * 站点规则库（F25/F26）：记录「字段指纹 → 槽位」，与档案数据解耦。
@@ -15,6 +16,28 @@ function isRule(value: unknown): value is SiteRule {
   return typeof rule.id === 'string' && typeof rule.domain === 'string' && rule.domain.length <= 300
     && typeof rule.fieldFingerprint === 'string' && rule.fieldFingerprint.length <= 300
     && typeof rule.slot === 'string' && Boolean(slotById(rule.slot))
+    && (rule.labelKey == null || (typeof rule.labelKey === 'string' && rule.labelKey.length <= 40))
+    && (rule.sectionId == null || typeof rule.sectionId === 'string')
+}
+
+/** 指纹优先。指纹对不上时，用户确认过的短标签可以命中同站同类字段。 */
+export function findSiteRule(rules: SiteRule[] | undefined, field: { fingerprint: string; label: string; sectionId?: string }): SiteRule | undefined {
+  if (!rules?.length) return undefined
+  const byFingerprint = rules.find(rule => !rule.disabled && rule.fieldFingerprint === field.fingerprint)
+  if (byFingerprint) return byFingerprint
+  const labelKey = normalize(field.label)
+  if (!labelKey) return undefined
+  const labeled = rules.filter(rule => !rule.disabled && rule.labelKey === labelKey && (!rule.sectionId || rule.sectionId === field.sectionId))
+  const slots = new Set(labeled.map(rule => rule.slot))
+  if (labeled.length && slots.size === 1) return labeled[0]
+  return undefined
+}
+
+function labelScope(label: string | undefined, sectionId: string | undefined): { labelKey?: string; sectionId?: string } {
+  const labelKey = label ? normalize(label) : ''
+  if (labelKey.length < 2 || labelKey.length > 20) return {}
+  if (aliasSectionCount(label || '') >= 2 && !sectionId) return {}
+  return { labelKey, sectionId: sectionId || undefined }
 }
 
 export async function loadSiteRules(): Promise<SiteRule[]> {
@@ -50,10 +73,11 @@ export function rulesForDomain(rules: SiteRule[], domain: string): SiteRule[] {
  * 修正即学习（F25）：用户把某字段的匹配从 A 改为 B 时记录规则。
  * 同一指纹已有规则且槽位不同时视为再次纠正：更新槽位并累计 failCount。
  */
-export async function recordCorrection(domain: string, fieldFingerprint: string, slot: string): Promise<SiteRule> {
+export async function recordCorrection(domain: string, fieldFingerprint: string, slot: string, meta?: { label?: string; sectionId?: string }): Promise<SiteRule> {
   if (!slotById(slot)) throw new Error(`未知槽位：${slot}`)
   const rules = await loadSiteRules()
   const now = new Date().toISOString()
+  const scope = labelScope(meta?.label, meta?.sectionId)
   const existing = rules.find(rule => rule.domain === domain && rule.fieldFingerprint === fieldFingerprint)
   if (existing) {
     if (existing.slot !== slot) {
@@ -61,13 +85,43 @@ export async function recordCorrection(domain: string, fieldFingerprint: string,
       existing.slot = slot
       existing.disabled = false
     }
+    if (scope.labelKey) {
+      existing.labelKey = scope.labelKey
+      existing.sectionId = scope.sectionId
+    }
     existing.updatedAt = now
     await saveSiteRules(rules)
     return existing
   }
   const rule: SiteRule = {
     id: crypto.randomUUID(), domain, fieldFingerprint, slot,
+    labelKey: scope.labelKey, sectionId: scope.sectionId,
     origin: 'user-correction', hitCount: 0, failCount: 0, disabled: false,
+    createdAt: now, updatedAt: now
+  }
+  await saveSiteRules([...rules, rule])
+  return rule
+}
+
+/**
+ * 记下一次非手工覆盖的槽位观察（AI 高置信、或高置信信号填写成功）。
+ * 已有规则且槽位不同时保留原规则，避免 AI 覆盖用户改过的指向。
+ */
+export async function recordObservation(domain: string, fieldFingerprint: string, slot: string, origin: SiteRule['origin']): Promise<SiteRule | null> {
+  if (!domain || !fieldFingerprint || !slotById(slot)) return null
+  const rules = await loadSiteRules()
+  const now = new Date().toISOString()
+  const existing = rules.find(rule => rule.domain === domain && rule.fieldFingerprint === fieldFingerprint)
+  if (existing) {
+    if (existing.slot !== slot) return existing
+    existing.hitCount += 1
+    existing.updatedAt = now
+    await saveSiteRules(rules)
+    return existing
+  }
+  const rule: SiteRule = {
+    id: crypto.randomUUID(), domain, fieldFingerprint, slot,
+    origin, hitCount: 1, failCount: 0, disabled: false,
     createdAt: now, updatedAt: now
   }
   await saveSiteRules([...rules, rule])
@@ -93,6 +147,17 @@ export async function recordFailure(ruleId: string): Promise<void> {
   if (!rule) return
   rule.failCount += 1
   if (rule.failCount >= 3 && rule.failCount > rule.hitCount) rule.disabled = true
+  rule.updatedAt = new Date().toISOString()
+  await saveSiteRules(rules)
+}
+
+/** 关掉后这条规则只认当前指纹，不再套到同站相同标签。 */
+export async function clearRuleLabelScope(ruleId: string): Promise<void> {
+  const rules = await loadSiteRules()
+  const rule = rules.find(item => item.id === ruleId)
+  if (!rule) return
+  delete rule.labelKey
+  delete rule.sectionId
   rule.updatedAt = new Date().toISOString()
   await saveSiteRules(rules)
 }

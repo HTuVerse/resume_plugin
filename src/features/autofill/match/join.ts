@@ -1,7 +1,8 @@
 import type { SlotDef } from '../../../domain/slots'
 import type { FillReasonCode, FormField } from '../../../domain/types'
-import { matchOption } from '../../ontology/optionMatch'
-import { normalizeEnumValue, validateType } from '../../ontology/validators'
+import { isPlaceholderOption, matchOption } from '../../ontology/optionMatch'
+import { isOngoingDate, normalizeEnumValue, splitOngoingRange, validateType } from '../../ontology/validators'
+import { splitCascadeValue } from '../write/recognizers'
 
 /**
  * 值域校验与归一化管线（F04/F05，硬闸门，TECH_DESIGN §6）。
@@ -28,6 +29,11 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
       return { ok: false, reason: `值类型校验未通过：${checked.reason}`, reasonCode: 'rejected-by-validation' }
     }
     value = checked.value
+    // 区间选择器要同时留下起止；普通年月字段仍只用校验后的第一段。
+    const range = field.range ? splitOngoingRange(raw) : null
+    if (range?.start && range.end && (slot.valueType === 'date' || slot.valueType === 'month' || isOngoingDate(range.end))) {
+      value = raw
+    }
 
     // 3. 枚举值域校验（valueType === 'enum' 时为硬校验）
     if (slot.valueType === 'enum') {
@@ -39,12 +45,26 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
     }
   }
 
-  // 4. 选项可达性校验（字段有选项集时）
-  if (field.options.length && ['select', 'multiselect', 'radio', 'checkbox'].includes(field.kind)) {
+  // 4. 选项可达性校验。下拉和级联与原生 select 同一套匹配。
+  // 选择类控件读不到至少两个真实选项时，不能当成已经核对过，留待确认。
+  if (['select', 'multiselect', 'radio', 'checkbox', 'combobox', 'cascade'].includes(field.kind)) {
+    const usable = field.options.filter(option => option.trim() && !isPlaceholderOption(option))
+    if (usable.length < 2) {
+      return {
+        ok: true,
+        value,
+        needsConfirmation: true,
+        reason: '页面没有读到足够的选项，请确认后再填写',
+        reasonCode: 'needs-confirmation'
+      }
+    }
     const values = field.kind === 'multiselect' || field.kind === 'checkbox'
       ? value.split(/[,，、|/]/).map(item => item.trim()).filter(Boolean)
-      : [value]
+      : field.kind === 'cascade'
+        ? splitCascadeValue(value)
+        : [value]
     let converted: { from: string; to: string } | null = null
+    const matched: string[] = []
     for (const single of values) {
       const match = matchOption(field.options, single)
       if (match.index < 0) {
@@ -53,11 +73,13 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
       if (match.ambiguous) {
         return { ok: true, value, needsConfirmation: true, reason: `「${single}」在选项集中有多个匹配，请确认`, reasonCode: 'needs-confirmation' }
       }
+      matched.push(field.options[match.index])
       if (match.reason !== 'exact') converted = { from: single, to: field.options[match.index] }
     }
     // 非全等命中（同义/等级/前缀）：给出转换后的待确认候选，不直接填入（PRD F04 验收）
     if (converted) {
       if (values.length === 1) value = converted.to
+      else if (field.kind === 'cascade') value = matched.join(' / ')
       return {
         ok: true, value, needsConfirmation: true,
         reason: `「${converted.from}」已按同义值转换为选项「${converted.to}」，请确认`,

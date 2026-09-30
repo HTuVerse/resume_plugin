@@ -1,8 +1,10 @@
 import type { AiSettings, BackupPayload, CurrentResume, Fact, LearnedAlias, ResumeTemplate, SiteRule, StoredProfile } from '../../domain/types'
 import { isRedacted, maskApiUrl, redactFacts } from '../privacy/privacy'
+import { foldProfileFacts } from '../../features/rag/knowledge'
 import { LEARNED_ALIASES_KEY, loadLearnedAliases, saveLearnedAliases } from '../../features/ontology/learnedAliases'
 import { SITE_RULES_KEY, loadSiteRules, saveSiteRules } from '../../features/siteRules/ruleStore'
 import { AI_SLOT_CACHE_KEY } from '../../features/ai/slotMatchCache'
+import { FILL_RECIPES_KEY, loadFillRecipes, saveFillRecipes } from '../../features/autofill/write/fillRecipes'
 
 const PROFILE_KEY = 'resumeProfileV1'
 const AI_SETTINGS_KEY = 'aiSettingsV1'
@@ -18,8 +20,8 @@ export async function loadProfile(): Promise<StoredProfile> {
     ? {
         // Older builds accidentally copied resume/AI extraction results into
         // the profile store. Keep “My Info” user-owned by dropping those rows.
-        facts: stored.facts.filter(isFact).filter(fact => fact.source !== 'resume' && fact.source !== 'ai')
-          .slice(0, 5000).map(fact => ({ ...fact, source: 'profile' as const })),
+        facts: foldProfileFacts(stored.facts.filter(isFact).filter(fact => fact.source !== 'resume' && fact.source !== 'ai')
+          .slice(0, 5000).map(fact => ({ ...fact, source: 'profile' as const }))),
         updatedAt: typeof stored.updatedAt === 'string' ? stored.updatedAt : ''
       }
     : { facts: [], updatedAt: '' }
@@ -33,8 +35,8 @@ function isFact(value: unknown): value is Fact {
 }
 
 export async function saveProfile(facts: Fact[]): Promise<void> {
-  const profileFacts = facts.filter(fact => fact.source !== 'resume' && fact.source !== 'ai')
-    .map(fact => ({ ...fact, source: 'profile' as const }))
+  const profileFacts = foldProfileFacts(facts.filter(fact => fact.source !== 'resume' && fact.source !== 'ai')
+    .map(fact => ({ ...fact, source: 'profile' as const })))
   await chrome.storage.local.set({ [PROFILE_KEY]: { facts: profileFacts, updatedAt: new Date().toISOString() } })
 }
 
@@ -165,7 +167,8 @@ export async function createBackup(redactSensitive = true): Promise<BackupPayloa
     },
     // 站点规则与学到的字段别名都不含个人数据，可不脱敏导出
     siteRules: await loadSiteRules(),
-    learnedAliases: await loadLearnedAliases()
+    learnedAliases: await loadLearnedAliases(),
+    fillRecipes: await loadFillRecipes()
   }
 }
 
@@ -211,6 +214,9 @@ export async function restoreBackup(payload: unknown): Promise<void> {
   if (Array.isArray(checked.learnedAliases)) {
     await saveLearnedAliases(checked.learnedAliases as LearnedAlias[])
   }
+  if (Array.isArray(checked.fillRecipes)) {
+    await saveFillRecipes(checked.fillRecipes)
+  }
   // Never restore credentials from an imported file. The exported API fields
   // are intentionally informational only and the current browser credential
   // remains untouched.
@@ -219,6 +225,6 @@ export async function restoreBackup(payload: unknown): Promise<void> {
 export async function clearAllLocalData(): Promise<void> {
   await chrome.storage.local.remove([
     PROFILE_KEY, AI_SETTINGS_KEY, TEMPLATES_KEY, CURRENT_RESUME_KEY, RESUME_LIBRARY_KEY,
-    'featureSettingsV1', SITE_RULES_KEY, SLOT_OVERRIDES_KEY, AI_SLOT_CACHE_KEY, LEARNED_ALIASES_KEY
+    'featureSettingsV1', SITE_RULES_KEY, SLOT_OVERRIDES_KEY, AI_SLOT_CACHE_KEY, LEARNED_ALIASES_KEY, FILL_RECIPES_KEY
   ])
 }

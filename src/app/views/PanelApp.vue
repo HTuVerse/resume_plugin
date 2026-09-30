@@ -1,23 +1,28 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { polishText, suggestSlotMatches } from '../../application/api'
-import { buildFactIndex, resolveField, type FactIndex } from '../../features/autofill/dataResolver'
+import { buildFactIndex, fieldsNeedingAi, resolveField, type FactIndex } from '../../features/autofill/dataResolver'
 import { factToSlot } from '../../features/autofill/match/factToSlot'
 import { aliasHit, aliasSectionCount, slotById } from '../../features/ontology/slotRegistry'
-import { getCachedSuggestions, putCachedSuggestions } from '../../features/ai/slotMatchCache'
-import { learnAlias } from '../../features/ontology/learnedAliases'
+import { looksLikeFieldPrompt, plainChoiceText } from '../../features/ontology/optionMatch'
+import { dropCachedSuggestion, getCachedSuggestions, putCachedSuggestions } from '../../features/ai/slotMatchCache'
+import { learnAlias, loadLearnedAliases, recordAliasFailure, recordAliasHit } from '../../features/ontology/learnedAliases'
+import { sectionOfText } from '../../features/ontology/sections'
+import { planRepeatExpansion } from '../../features/autofill/scan/repeatExpand'
 import { classifyPageInput, knowledgeIdentity, mergeIntoKnowledge, type LearnedEntry } from '../../features/rag/knowledge'
+import { isLearnedDismissed, learnedDismissKey } from '../../features/rag/learnedDismiss'
 import { alignFamilyItem, familyItemForRelation, isFamilyField, isRelationField, relationKey } from '../../features/autofill/familyAlign'
 import { alignNamedItem, dateSlotId, fillNamedItem, nameSlotId, namedSectionOf } from '../../features/autofill/namedSegment'
-import { recordCorrection, recordFailure, recordHit } from '../../features/siteRules/ruleStore'
+import { recordCorrection, recordFailure, recordHit, recordObservation } from '../../features/siteRules/ruleStore'
 import { beginPanelDrag, closePanel, onContentEvent, requestContent, resizePanel } from '../bridge/panelBridge'
 import { loadAiSettings, loadCurrentResume, loadProfile, saveProfile } from '../../infrastructure/storage/store'
 import { activate, loadLicense, type LicenseRecord } from '../../features/license/license'
-import type { AiSettings, CurrentResume, Fact, FillRequest, FillResult, FormField, PageContext, ResolvedField, SlotSuggestion } from '../../domain/types'
+import type { AiSettings, CurrentResume, Fact, FillRequest, FillResult, FormField, LearnedAlias, PageContext, ResolvedField, SlotSuggestion } from '../../domain/types'
 import OptionsApp from './OptionsApp.vue'
 import { mergeFactsByPriority } from '../../features/autofill/factPriority'
 
 const facts = ref<Fact[]>([])
+const learnedAliasRows = ref<LearnedAlias[]>([])
 const currentResume = ref<CurrentResume | null>(null)
 const aiSettings = ref<AiSettings>({ url: '', key: '', model: '' })
 const fields = ref<FormField[]>([])
@@ -40,7 +45,13 @@ const newFieldsHint = ref(0)
  * 确认前可在线编辑 value，确认后才写入知识库。
  */
 const learned = ref<Array<LearnedEntry & { selected: boolean; origin: 'supplement' | 'correction'; previous: string; fieldId: string; pageValue?: string }>>([])
+/** 本次填写会话里放弃过的字段页面值。不写入存储，重新识别或重新读取后清空。 */
+const dismissedLearned = new Set<string>()
 const learnedListEl = ref<HTMLElement | null>(null)
+/** 用户还停在列表底部时，新记录才跟着滚下去。往上翻之后不再拽回来。 */
+let learnedPinned = true
+let suppressLearnedScroll = false
+const revealedLearned = new Set<string>()
 const featureSettings = reactive({ autoClipboard: true, aiMapping: true, miniPanel: true, aiMatchThreshold: 85 })
 const selectedField = computed(() => fields.value.find(field => field.id === selectedPolishField.value))
 const polishableFields = computed(() => fields.value.filter(field => field.kind === 'textarea'
@@ -130,6 +141,7 @@ onMounted(async () => {
   licenseChecked.value = true
   if (!license.value) resizePanel('activation')
   facts.value = tagFacts((await loadProfile()).facts, 'profile')
+  learnedAliasRows.value = await loadLearnedAliases()
   currentResume.value = await loadCurrentResume()
   aiSettings.value = await loadAiSettings()
   const storedFeatures = await chrome.storage.local.get('featureSettingsV1')
@@ -293,11 +305,16 @@ function realignNamedLearned(field: FormField, item: number): void {
   })
 }
 
+function pageHasSection(section: string): boolean {
+  return fields.value.some(field => field.sectionId === section || sectionOfText(field.group) === section)
+}
+
 function resolveOne(field: FormField): void {
   const resolved = resolveField(field, factIndex.value, {
     aiSuggestion: aiSuggestions[field.id],
     aiMatchThreshold: featureSettings.aiMatchThreshold,
-    segmentItem: isFamilyField(field) ? familySegmentItem(field) : namedSegmentItem(field)
+    segmentItem: isFamilyField(field) ? familySegmentItem(field) : namedSegmentItem(field),
+    legacyWorkFallback: !pageHasSection('internship')
   })
   resolutions[field.id] = resolved
   selections[field.id] = resolved.factId && (resolved.status === 'ready' || resolved.status === 'needs-confirmation') ? resolved.factId : ''
@@ -324,6 +341,7 @@ async function runAutoFill() {
   // 这一轮写完之前不监测网页修改，避免把填写过程本身学进知识库。
   knowledgeWatch.value = false
   learned.value = []
+  dismissedLearned.clear()
   await scan()
   if (!fields.value.length) { status.value = '当前页面没有发现可填写的表单字段。'; return }
   if (featureSettings.aiMapping && aiReady.value) await aiMatch()
@@ -350,6 +368,25 @@ async function startAutoFillFromHome() {
   await autoFill()
 }
 
+function applyScan(response: { fields?: FormField[]; context?: PageContext | null }): void {
+  fields.value = response.fields || []
+  pageContext.value = response.context || null
+  for (const record of [aiSuggestions, resolutions, selections, results]) {
+    for (const key of Object.keys(record)) delete record[key]
+  }
+  for (const field of fields.value) resolveOne(field)
+}
+
+/** 档案段数多于页面块数时，点「新增一段」再扫一次。只补一轮。 */
+async function expandRepeatsIfNeeded(): Promise<number> {
+  const demands = planRepeatExpansion(fields.value, allFacts.value)
+  if (!demands.length) return 0
+  const response = await requestContent({ type: 'EXPAND_REPEATS', demands })
+  if (response.error) return 0
+  const rows = (response.clicked || []) as Array<{ count: number }>
+  return rows.reduce((sum, row) => sum + (row.count || 0), 0)
+}
+
 async function scan() {
   busy.value = true
   status.value = '正在读取当前页面…'
@@ -357,32 +394,37 @@ async function scan() {
   suggestion.value = ''
   newFieldsHint.value = 0
   learned.value = []
+  dismissedLearned.clear()
   try {
     facts.value = tagFacts((await loadProfile()).facts, 'profile')
     const response = await requestContent({ type: 'SCAN' })
     if (response.error) throw new Error(response.error)
-    fields.value = response.fields || []
-    pageContext.value = response.context || null
-    for (const key of Object.keys(aiSuggestions)) delete aiSuggestions[key]
-    for (const field of fields.value) {
-      resolveOne(field)
-      delete results[field.id]
+    applyScan(response)
+    let added = 0
+    if (planRepeatExpansion(fields.value, allFacts.value).length) {
+      status.value = '档案里的经历比页面上多，正在补行…'
+      added = await expandRepeatsIfNeeded()
+      if (added) {
+        const again = await requestContent({ type: 'SCAN' })
+        if (again.error) throw new Error(again.error)
+        applyScan(again)
+      }
     }
     const ready = Object.values(resolutions).filter(item => item.status === 'ready').length
     const pending = Object.values(resolutions).filter(item => item.status === 'needs-confirmation').length
     const frames = pageContext.value?.frames?.length || 1
-    status.value = `识别 ${fields.value.length} 个字段（${frames > 1 ? `${frames} 个 frame，` : ''}已确认 ${ready} 个，待确认 ${pending} 个）。`
+    const addedNote = added ? `已自动补充 ${added} 段。` : ''
+    status.value = `识别 ${fields.value.length} 个字段（${frames > 1 ? `${frames} 个 frame，` : ''}已确认 ${ready} 个，待确认 ${pending} 个）。${addedNote}`
   } catch (error) { status.value = error instanceof Error ? error.message : '页面识别失败。' }
   finally { busy.value = false }
 }
 
 /**
- * AI 分析表单（两步填充的第一步）：把整张表单的字段元信息交给 AI，
- * 判断每个字段在问什么（映射到知识库槽位）；本地规则已精确命中的字段跳过。
- * AI 只输出槽位、不接触个人数据，填值仍由知识库连接 + 校验闸门完成（F42）。
+ * 二级填充：只把一级还没精确命中的空字段和知识库交给 AI。
+ * AI 只能指向已有槽位或已有条目。别名等这次写入成功，或用户确认后再记。
  */
 async function aiMatch() {
-  const pending = fields.value.filter(field => !field.current.trim() && resolutions[field.id]?.status !== 'ready')
+  const pending = fieldsNeedingAi(fields.value, id => resolutions[id]?.status)
   if (!pending.length) {
     status.value = '所有空字段都已精确匹配到知识库，无需 AI 分析。'
     return
@@ -393,14 +435,15 @@ async function aiMatch() {
     aiSettings.value = await loadAiSettings()
     const domain = pageDomain()
     // 先查缓存（F43）：同站同指纹不重复请求
-    const cached = await getCachedSuggestions(domain, pending.map(field => ({ fieldId: field.id, fingerprint: field.fingerprint })))
+    const knownFactIds = new Set(allFacts.value.map(fact => fact.id))
+    const cached = await getCachedSuggestions(domain, pending.map(field => ({ fieldId: field.id, fingerprint: field.fingerprint })), allFacts.value)
     const cachedIds = new Set(cached.map(item => item.fieldId))
     const remaining = pending.filter(field => !cachedIds.has(field.id))
     let fresh: SlotSuggestion[] = []
     if (remaining.length) {
       if (!aiReady.value) throw new Error('请先在档案设置中保存 API URL、API Key 和模型名称。')
       fresh = await suggestSlotMatches(remaining, allFacts.value, aiSettings.value)
-      await putCachedSuggestions(domain, fresh.flatMap(item => {
+      await putCachedSuggestions(domain, allFacts.value, fresh.flatMap(item => {
         const field = fields.value.find(candidate => candidate.id === item.fieldId)
         return field ? [{ fingerprint: field.fingerprint, suggestion: item }] : []
       }))
@@ -408,7 +451,9 @@ async function aiMatch() {
     let adopted = 0
     for (const item of [...cached, ...fresh]) {
       const field = fields.value.find(candidate => candidate.id === item.fieldId)
-      if (!field || !slotById(item.slot)) continue
+      const validSlot = item.slot ? slotById(item.slot) : undefined
+      const validFact = item.factId ? knownFactIds.has(item.factId) : false
+      if (!field || (!validSlot && !validFact)) continue
       aiSuggestions[field.id] = item
       resolveOne(field)
       if (resolutions[field.id]?.status === 'ready' || resolutions[field.id]?.status === 'needs-confirmation') adopted += 1
@@ -417,6 +462,26 @@ async function aiMatch() {
     status.value = `AI 分析完成：${adopted} 个字段已对应到知识库并取到值（其中缓存命中 ${cached.length} 个）${unmatched > 0 ? `，${unmatched} 个字段知识库没有对应数据` : ''}。请核对后点击「填写匹配字段」。`
   } catch (error) { status.value = error instanceof Error ? error.message : 'AI 匹配失败。' }
   finally { busy.value = false }
+}
+
+/** AI 高置信不覆盖用户改过的别名；用户确认时 overwrite。同名多板块只记站点指纹。 */
+function rememberFieldMapping(field: FormField, slot: string, domain: string, overwrite: boolean) {
+  const shared = aliasSectionCount(field.label) >= 2
+  if (field.label.trim() && (!shared || field.sectionId)) {
+    learnAlias(field.label, slot, { overwrite, sectionId: shared ? field.sectionId : undefined })
+      .then(result => {
+        if (result === 'conflict') status.value = `「${field.label}」已经对应到别的槽位，这次没有改写。`
+        return loadLearnedAliases()
+      })
+      .then(rows => { learnedAliasRows.value = rows })
+      .catch(() => undefined)
+  }
+  if (overwrite && domain) dropCachedSuggestion(domain, field.fingerprint).catch(() => undefined)
+  if (!domain) return
+  const save = overwrite
+    ? recordCorrection(domain, field.fingerprint, slot, { label: field.label, sectionId: field.sectionId })
+    : recordObservation(domain, field.fingerprint, slot, 'ai')
+  save.catch(() => undefined)
 }
 
 /** 用户在下拉中改选档案值：修正即学习（F25），记录（域名, 指纹, 槽位）。 */
@@ -439,14 +504,10 @@ async function selectionChanged(field: FormField) {
     slot: slot || field.slot
   }
   if (slot) {
-    // 字段措辞学习：该标签成为该槽位的别名，下次任何网站出现相同标签直接命中
-    if (field.label.trim()) learnAlias(field.label, slot).catch(() => undefined)
     const domain = pageDomain()
+    rememberFieldMapping(field, slot, domain, true)
     if (domain && slot !== field.slot) {
-      try {
-        await recordCorrection(domain, field.fingerprint, slot)
-        status.value = `已记录该站点的字段规则（${field.label || field.fingerprint} → ${slotById(slot)?.aliases[0] || slot}），下次自动命中。`
-      } catch { /* 学习失败不影响填写 */ }
+      status.value = `已记录该站点的字段规则（${field.label || field.fingerprint} → ${slotById(slot)?.aliases[0] || slot}），下次自动命中。`
     }
   }
 }
@@ -466,14 +527,17 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
     return [{
       fieldId: field.id,
       value: resolution?.value || value,
-      overwrite: Boolean(onlyFieldId),
       source: resolution?.source === 'empty' ? fact?.source : resolution?.source,
       confidence: resolution?.confidence,
       slot: resolution?.slot
     }]
   })
   if (!values.length) {
-    const watchNote = options?.armKnowledgeWatch ? '监测尚未开始。' : ''
+    if (options?.armKnowledgeWatch) {
+      knowledgeWatch.value = true
+      learned.value = []
+    }
+    const watchNote = options?.armKnowledgeWatch ? '正在监测你之后在网页上的修改。' : ''
     status.value = pendingCount
       ? `没有达到自动填写阈值的字段；${pendingCount} 个待确认（低于匹配阈值或选项需核对）请先在下拉中逐项确认。${watchNote}`
       : `请先为至少一个字段选择档案信息。${watchNote}`
@@ -493,6 +557,26 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
           recordFailure(field.ruleId).catch(() => undefined)
         }
       }
+      if (field?.learnedAlias) {
+        if (result.status === 'filled') recordAliasHit(field.learnedAlias, field.sectionId).catch(() => undefined)
+        else if (result.reasonCode === 'no-matching-option' || result.reasonCode === 'rejected-by-validation') {
+          recordAliasFailure(field.learnedAlias, field.sectionId).catch(() => undefined)
+        }
+      }
+      if (result.status === 'filled' && field) {
+        const slot = resolutions[field.id]?.slot || field.slot
+        const suggestion = aiSuggestions[field.id]
+        const viaAi = resolutions[field.id]?.source === 'ai'
+          && suggestion
+          && suggestion.confidence * 100 >= featureSettings.aiMatchThreshold
+        if (viaAi && slot) rememberFieldMapping(field, slot, pageDomain(), false)
+        else {
+          const signals = field.slotCandidates?.[0]?.signals || {}
+          const inferred = signals.labelMatch !== 1 && !signals.learnedAlias && !signals.siteRule && !field.ruleId
+          const domain = pageDomain()
+          if (inferred && slot && domain) recordObservation(domain, field.fingerprint, slot, 'fill').catch(() => undefined)
+        }
+      }
     }
     const rows = response.results as FillResult[]
     const filled = rows.filter(result => result.status === 'filled').length
@@ -508,14 +592,23 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
   finally { busy.value = false }
 }
 
-/** 新增一行后把列表和所在表单滚到底，避免新行被下方按钮挡住。 */
-function revealLatestLearned(): void {
+function onLearnedScroll(): void {
+  if (suppressLearnedScroll) return
+  const list = learnedListEl.value
+  if (!list) return
+  learnedPinned = list.scrollHeight - list.scrollTop - list.clientHeight <= 28
+}
+
+/** 新增一行后，只有列表本来就在底部才跟着滚。不滚动外层面板。 */
+function revealLatestLearned(force = false): void {
   nextTick(() => {
-    const list = learnedListEl.value
-    if (!list) return
-    list.scrollTop = list.scrollHeight
-    const row = list.lastElementChild instanceof HTMLElement ? list.lastElementChild : null
-    row?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    requestAnimationFrame(() => {
+      const list = learnedListEl.value
+      if (!list || (!force && !learnedPinned)) return
+      suppressLearnedScroll = true
+      list.scrollTop = list.scrollHeight
+      requestAnimationFrame(() => { suppressLearnedScroll = false })
+    })
   })
 }
 
@@ -525,14 +618,26 @@ function revealLatestLearned(): void {
  * 页面上把内容删掉后，对应的待确认项一并去掉。
  * quiet 用于识别时吸收页面上已经填好的内容，不打断当前状态文案。
  */
+function learnedValue(field: FormField, raw: string): string {
+  const now = plainChoiceText(raw)
+  if (!now || looksLikeFieldPrompt(now)) return ''
+  if (field.placeholder && now === field.placeholder.trim()) return ''
+  if (field.label && now === field.label.trim()) return ''
+  const taken = fields.value.some(other => other.id !== field.id && (
+    (other.label && now === other.label.trim()) || (other.placeholder && now === other.placeholder.trim())
+  ))
+  return taken ? '' : now
+}
+
 function noteObservedValue(field: FormField, raw: string, quiet = false): void {
-  const now = raw.trim()
+  const now = learnedValue(field, raw)
   const learnedAt = () => learned.value.findIndex(row => row.fieldId === field.id)
   const drop = () => {
     const index = learnedAt()
     if (index >= 0) learned.value.splice(index, 1)
   }
   if (field.attrs?.type === 'password') return
+  if (now && learnedAt() < 0 && isLearnedDismissed(dismissedLearned, field.id, now)) return
   if (!now) {
     // 单选没有“清空”。回读短暂为空时不能把刚记下的选项删掉。
     if (field.kind === 'radio') return
@@ -562,7 +667,7 @@ function noteObservedValue(field: FormField, raw: string, quiet = false): void {
   }
   const slot = field.slot || resolutions[field.id]?.slot
   const sourceField = slot && slot !== field.slot ? { ...field, slot } : field
-  const entry = classifyPageInput(sourceField, now)
+  const entry = classifyPageInput(sourceField, now, learnedAliasRows.value)
   if (!entry) return
   if (isFamilyField(sourceField)) {
     const relation = segmentRelation(sourceField, { id: field.id, value: now }) || (isRelationField(sourceField) ? relationKey(now) : '')
@@ -597,7 +702,10 @@ function noteObservedValue(field: FormField, raw: string, quiet = false): void {
   if (index >= 0) learned.value[index] = row
   else {
     learned.value.push(row)
-    revealLatestLearned()
+    if (!revealedLearned.has(field.id)) {
+      revealedLearned.add(field.id)
+      revealLatestLearned()
+    }
   }
   if (!quiet) status.value = `已记录「${entry.fact.key}」→ ${now.slice(0, 24)}。请确认后再更新知识库。`
 }
@@ -623,7 +731,6 @@ async function pollLearned(): Promise<void> {
     const valueMap = new Map<string, string>((response.values || []).map((row: { fieldId: string; value: string }) => [row.fieldId, row.value]))
     for (const field of fields.value) noteObservedValue(field, valueMap.get(field.id) || '', true)
     const added = learned.value.filter(row => !known.has(row.fieldId))
-    if (added.length) revealLatestLearned()
     if (learnedWatchSeen && added.length) {
       status.value = added.length === 1
         ? `已记录「${added[0].fact.key}」→ ${added[0].fact.value.slice(0, 24)}。请确认后再更新知识库。`
@@ -637,6 +744,8 @@ async function pollLearned(): Promise<void> {
 watch(knowledgeWatch, armed => {
   stopLearnedWatch()
   if (!armed) return
+  learnedPinned = true
+  revealedLearned.clear()
   void pollLearned()
   learnedWatchTimer = window.setInterval(() => { void pollLearned() }, 700)
 })
@@ -649,6 +758,7 @@ async function collectLearned() {
   try {
     const response = await requestContent({ type: 'READ_VALUES' })
     if (response.error) throw new Error(response.error)
+    dismissedLearned.clear()
     const valueMap = new Map<string, string>((response.values || []).map((row: { fieldId: string; value: string }) => [row.fieldId, row.value]))
     for (const field of fields.value) noteObservedValue(field, valueMap.get(field.id) || '', true)
     if (learned.value.length) revealLatestLearned()
@@ -669,15 +779,39 @@ async function saveLearned() {
   }).slice(0, 6).join('、')
   if (!confirm(`确认更新知识库 ${chosen.length} 条？\n${summary}${chosen.length > 6 ? ' 等' : ''}\n同一板块、同一段里的同名字段会被更新。`)) return
   const merged = mergeIntoKnowledge(facts.value, chosen.map(entry => ({ ...entry.fact, value: entry.fact.value.trim() })))
-  facts.value = tagFacts(merged.facts, 'profile')
   await saveProfile(merged.facts)
+  facts.value = tagFacts((await loadProfile()).facts, 'profile')
+  const domain = pageDomain()
   for (const entry of chosen) {
-    if (entry.slot && entry.fieldLabel.trim() && aliasSectionCount(entry.fieldLabel) < 2) {
-      learnAlias(entry.fieldLabel, entry.slot).catch(() => undefined)
+    const field = fields.value.find(item => item.id === entry.fieldId)
+    if (entry.slot && entry.fieldLabel.trim() && (aliasSectionCount(entry.fieldLabel) < 2 || entry.fact.group)) {
+      const sectionId = aliasSectionCount(entry.fieldLabel) >= 2 ? field?.sectionId : undefined
+      if (aliasSectionCount(entry.fieldLabel) < 2 || sectionId) {
+        await learnAlias(entry.fieldLabel, entry.slot, { overwrite: true, sectionId }).catch(() => undefined)
+      }
+    }
+    if (domain && field?.fingerprint && entry.slot) {
+      await recordCorrection(domain, field.fingerprint, entry.slot, { label: entry.fieldLabel, sectionId: field.sectionId }).catch(() => undefined)
+      await dropCachedSuggestion(domain, field.fingerprint).catch(() => undefined)
     }
   }
+  learnedAliasRows.value = await loadLearnedAliases()
+  rememberDismissedLearned(learned.value.filter(entry => !entry.selected || !entry.fact.value.trim()))
   learned.value = []
   status.value = `知识库已更新：新增 ${merged.added} 条、更新 ${merged.updated} 条。下次遇到相同字段会自动匹配。`
+}
+
+function rememberDismissedLearned(rows: Array<{ fieldId: string; pageValue?: string; fact: { value: string } }>): void {
+  for (const row of rows) {
+    const pageValue = (row.pageValue ?? row.fact.value).trim()
+    if (row.fieldId && pageValue) dismissedLearned.add(learnedDismissKey(row.fieldId, pageValue))
+  }
+}
+
+function abandonLearned(): void {
+  rememberDismissedLearned(learned.value)
+  learned.value = []
+  status.value = '已放弃这些待确认内容。页面上的这些值不会再次列入，直到你改成新的内容。'
 }
 
 async function copyValue(value: string): Promise<boolean> {
@@ -727,7 +861,10 @@ async function confirmAiField(fieldId: string) {
   const response = await requestContent({ type: 'CONFIRM_FIELD', fieldId })
   if (response?.status === 'confirmed') {
     if (results[fieldId]) results[fieldId] = { ...results[fieldId], source: 'manual' }
-    status.value = '该 AI 匹配结果已确认，字段已恢复正常高亮。'
+    const field = fields.value.find(item => item.id === fieldId)
+    const slot = resolutions[fieldId]?.slot || field?.slot
+    if (field && slot) rememberFieldMapping(field, slot, pageDomain(), true)
+    status.value = '该 AI 匹配结果已确认，字段已恢复正常高亮，并记为本站规则。'
   } else {
     status.value = '网页字段已变化，请重新识别后再确认。'
   }
@@ -768,7 +905,7 @@ async function polish() {
 async function adopt() {
   if (!selectedPolishField.value || !suggestion.value.trim()) return
   try {
-    const response = await requestContent({ type: 'FILL', values: [{ fieldId: selectedPolishField.value, value: suggestion.value.trim(), overwrite: true }] })
+    const response = await requestContent({ type: 'FILL', values: [{ fieldId: selectedPolishField.value, value: suggestion.value.trim(), intent: 'manual' }] })
     const result = (response.results as FillResult[])[0]
     if (result) results[result.fieldId] = result
     status.value = result?.status === 'filled' ? '建议已写入网页，请在提交前核对。' : result?.message || '写入失败。'
@@ -891,17 +1028,18 @@ function resultDetail(result: FillResult): string {
           <p v-if="!knowledgeWatch" class="knowledge-hint">请先点击「自动填写」。本页填充完成后，这里才会开始记录你在网页上的补充和修改。</p>
           <p v-else-if="!learned.length" class="knowledge-empty">正在监测。你在网页上补充或改过字段后，会列在这里，确认后才写入知识库。清空网页上的内容会去掉对应的待确认项。</p>
           <template v-else>
-            <div ref="learnedListEl" class="learned-list">
+            <div ref="learnedListEl" class="learned-list" @scroll="onLearnedScroll">
               <div v-for="entry in learned" :key="entry.fact.id" class="learned-row">
                 <input v-model="entry.selected" type="checkbox" :aria-label="`更新 ${entry.fact.key}`" />
                 <div class="learned-body">
                   <span class="learned-meta">{{ entry.fact.group }}<template v-if="entry.fact.item > 1"> · 第 {{ entry.fact.item }} 段</template> · {{ entry.fact.key }}<em v-if="entry.custom">（自定义字段）</em><b :class="entry.origin">{{ entry.origin === 'correction' ? '修正' : '补充' }}</b></span>
+                  <small v-if="entry.fieldLabel.trim() && entry.fieldLabel.trim() !== entry.fact.key" class="learned-previous">网页字段：{{ entry.fieldLabel }}</small>
                   <small v-if="entry.previous" class="learned-previous">知识库原值：{{ entry.previous.slice(0, 40) }}</small>
                   <input v-model="entry.fact.value" type="text" :aria-label="`${entry.fact.key} 的值`" />
                 </div>
               </div>
             </div>
-            <div class="panel-action-row"><button class="panel-primary" :disabled="busy" @click="saveLearned">确认并更新知识库</button><button @click="learned = []">放弃</button></div>
+            <div class="panel-action-row"><button class="panel-primary" :disabled="busy" @click="saveLearned">确认并更新知识库</button><button @click="abandonLearned">放弃</button></div>
           </template>
         </section>
         <p :class="['panel-status', { loading: autoFillRunning }]" role="status"><span v-if="autoFillRunning" class="inline-loading"></span>{{ status }}</p>
@@ -1359,7 +1497,7 @@ function resultDetail(result: FillResult): string {
   line-height: 23px;
 }
 
-.compact-mode .compact-content { padding: 0 10px 6px; }
+.compact-mode .compact-content { padding: 0 10px 6px; overflow-anchor: none; }
 
 .compact-mode .ready-card {
   min-height: 48px;
@@ -1710,6 +1848,7 @@ function resultDetail(result: FillResult): string {
   max-height: 220px;
   margin-top: 6px;
   overflow-y: auto;
+  overflow-anchor: none;
   scroll-padding-bottom: 12px;
 }
 

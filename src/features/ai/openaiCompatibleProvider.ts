@@ -1,6 +1,7 @@
 import { parseJsonResponse } from './responseParser'
 import { FIELD_MATCHER_SYSTEM, polishSystem, RESUME_EXTRACTOR_RETRY_SYSTEM, RESUME_EXTRACTOR_SYSTEM } from './prompts'
 import { slotById } from '../ontology/slotRegistry'
+import { factToSlot } from '../autofill/match/factToSlot'
 import { aiFail, aiOk, type AiProvider, type AiResult, type ChatMessage, type FieldMatchResult, type PolishResult, type ResumeExtraction } from './aiProvider'
 import type { AiSettings, Fact, FormField, SlotSuggestion } from '../../domain/types'
 
@@ -135,6 +136,49 @@ function safeFacts(facts: Fact[]): Array<Pick<Fact, 'id' | 'group' | 'item' | 'k
   }))
 }
 
+/** 将不可信的 AI JSON 收敛为可由本地闸门继续处理的建议。 */
+export function parseFieldMatchSuggestions(value: any, fields: FormField[], facts: Fact[]): SlotSuggestion[] | null {
+  const rows = Array.isArray(value) ? value : value?.matches
+  if (!Array.isArray(rows)) return null
+  const fieldsById = new Map(fields.map(field => [field.id, field]))
+  const factsById = new Map(facts.map(fact => [fact.id, fact]))
+  const bestByField = new Map<string, SlotSuggestion>()
+
+  for (const item of rows) {
+    if (!item || typeof item !== 'object') continue
+    const fieldId = typeof item.fieldId === 'string' ? item.fieldId : ''
+    const field = fieldsById.get(fieldId)
+    if (!field) continue
+
+    const requestedSlot = typeof item.slot === 'string' && slotById(item.slot) ? item.slot : undefined
+    // 第一层已经认出的页面语义优先，第二层不能把它改到另一个槽位。
+    if (field.slot && requestedSlot && field.slot !== requestedSlot) continue
+
+    const fact = typeof item.factId === 'string' ? factsById.get(item.factId) : undefined
+    const knownFactSlot = fact ? factToSlot(fact).slot : undefined
+    const slot = requestedSlot || field.slot || knownFactSlot
+    // 已能由本地本体识别的知识条目，不允许被 AI 指向语义冲突的槽位。
+    if (slot && knownFactSlot && slot !== knownFactSlot) continue
+    if (!slot && !fact) continue
+
+    const adapted = typeof item.adaptedValue === 'string' ? item.adaptedValue.trim() : ''
+    const adaptedValue = fact && adapted && adapted !== fact.value.trim() && fact.value.includes(adapted)
+      ? adapted
+      : undefined
+    const suggestion: SlotSuggestion = {
+      fieldId,
+      slot,
+      factId: fact?.id,
+      adaptedValue,
+      confidence: Math.min(1, Math.max(0, Number(item.confidence) || 0.6)),
+      reason: String(item.reason || 'AI 语义判定')
+    }
+    const previous = bestByField.get(fieldId)
+    if (!previous || suggestion.confidence > previous.confidence) bestByField.set(fieldId, suggestion)
+  }
+  return [...bestByField.values()]
+}
+
 export class OpenAICompatibleProvider implements AiProvider {
   constructor(private readonly settings: AiSettings) {}
 
@@ -248,44 +292,28 @@ export class OpenAICompatibleProvider implements AiProvider {
   /**
    * 表单字段 → 知识库匹配：
    * - 字段元信息 + 知识库内容一起送入，AI 负责字段名近义映射和值粒度适配。
-   * - 输出槽位不在注册表内即丢弃；factId 必须真实存在于知识库；
+   * - 已知字段可返回注册表槽位；本体外字段可只引用真实存在的 factId；
    *   adaptedValue 必须是所引用条目原值的连续子串（防止编造），否则丢弃该项。
    */
   async matchFields(fields: FormField[], facts: Fact[] = []): Promise<AiResult<FieldMatchResult>> {
     if (!fields.length) return aiOk({ suggestions: [] })
     const knowledge = facts.filter(fact => fact.value.trim()).slice(0, 300)
-    const knowledgeById = new Map(knowledge.map(fact => [fact.id, fact]))
     const parsed = parseJsonResponse(await this.chat([
       { role: 'system', content: FIELD_MATCHER_SYSTEM },
       {
         role: 'user',
         content: JSON.stringify({
-          fields: fields.slice(0, 300).map(({ id, label, group, placeholder, kind, options, required, maxLength, item, sectionId }) => ({
-            id, label, group, placeholder, kind, options: options.slice(0, 100), required, maxLength, item, section: sectionId
+          fields: fields.slice(0, 300).map(({ id, label, group, placeholder, kind, options, required, maxLength, item, sectionId, slot, slotStatus }) => ({
+            id, label, group, placeholder, kind, options: options.slice(0, 100), required, maxLength, item, section: sectionId,
+            localSlot: slot, localStatus: slotStatus
           })),
           knowledge: knowledge.map(({ id, group, item, key, value }) => ({ factId: id, group, item, key, value: value.slice(0, 300) }))
         })
       }
     ]))
     if (!parsed.ok) return aiFail(parsed.error)
-    const rows = Array.isArray(parsed.value) ? parsed.value : parsed.value?.matches
-    if (!Array.isArray(rows)) return aiFail('AI 返回的 JSON 中没有 matches 数组。')
-    const suggestions = rows
-      .filter((item: any) => item?.fieldId && typeof item.slot === 'string' && slotById(item.slot))
-      .map((item: any): SlotSuggestion => {
-        const fact = typeof item.factId === 'string' ? knowledgeById.get(item.factId) : undefined
-        const adapted = typeof item.adaptedValue === 'string' ? item.adaptedValue.trim() : ''
-        // 适配值必须是原值的连续子串，否则视为编造并丢弃
-        const adaptedValue = fact && adapted && adapted !== fact.value.trim() && fact.value.includes(adapted) ? adapted : undefined
-        return {
-          fieldId: String(item.fieldId),
-          slot: String(item.slot),
-          factId: fact?.id,
-          adaptedValue,
-          confidence: Math.min(1, Math.max(0, Number(item.confidence) || 0.6)),
-          reason: String(item.reason || 'AI 语义判定')
-        }
-      })
+    const suggestions = parseFieldMatchSuggestions(parsed.value, fields.slice(0, 300), knowledge)
+    if (!suggestions) return aiFail('AI 返回的 JSON 中没有 matches 数组。')
     return aiOk({ suggestions })
   }
 

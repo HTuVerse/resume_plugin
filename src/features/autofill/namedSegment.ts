@@ -9,13 +9,14 @@ import { normalize } from '../../shared/normalize'
  * 时间和其他字段跟着名称走。同名再用该段的结束时间或获奖时间区分。
  */
 
-export type NamedSection = 'education' | 'project' | 'internship' | 'campus' | 'award' | 'certificate'
+export type NamedSection = 'education' | 'project' | 'work' | 'internship' | 'campus' | 'award' | 'certificate'
 
-const NAMED_SECTIONS: NamedSection[] = ['education', 'project', 'internship', 'campus', 'award', 'certificate']
+const NAMED_SECTIONS: NamedSection[] = ['education', 'project', 'work', 'internship', 'campus', 'award', 'certificate']
 
 const NAME_SLOT: Record<NamedSection, string> = {
   education: 'education.school',
   project: 'project.name',
+  work: 'work.company',
   internship: 'internship.company',
   campus: 'campus.name',
   award: 'award.name',
@@ -24,6 +25,7 @@ const NAME_SLOT: Record<NamedSection, string> = {
 const DATE_SLOT: Record<NamedSection, string> = {
   education: 'education.endDate',
   project: 'project.endDate',
+  work: 'work.endDate',
   internship: 'internship.endDate',
   campus: 'campus.endDate',
   award: 'award.date',

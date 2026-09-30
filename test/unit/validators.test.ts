@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeDateValue, splitDateRange, validateType } from '../../src/features/ontology/validators'
+import { isOngoingDate, normalizeDateValue, splitDateRange, splitOngoingRange, validateType } from '../../src/features/ontology/validators'
 
 describe('splitDateRange', () => {
   it('拆分「2021.9-2025.6」这类区间串', () => {
@@ -41,6 +41,12 @@ describe('validateType', () => {
   it('日期：非法日期被拒绝', () => {
     expect(validateType('date', '2023年13月').ok).toBe(false)
     expect(validateType('month', '2021.9-2025.6').value).toBe('2021-09')
+  })
+  it('至今可以作为结束时间', () => {
+    expect(isOngoingDate('至今')).toBe(true)
+    expect(validateType('month', '至今').ok).toBe(true)
+    expect(validateType('month', '至今').value).toBe('至今')
+    expect(splitOngoingRange('2021-09至今')).toEqual({ start: '2021-09', end: '至今' })
   })
   it('布尔归一', () => {
     expect(validateType('boolean', '愿意').value).toBe('是')

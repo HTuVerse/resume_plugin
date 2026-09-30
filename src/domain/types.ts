@@ -2,7 +2,7 @@ import type { SlotDecisionStatus, SlotScore } from './slots'
 
 export type DataSource = 'profile' | 'resume' | 'ai' | 'manual'
 
-export type FieldKind = 'text' | 'textarea' | 'select' | 'multiselect' | 'cascade' | 'radio' | 'checkbox' | 'combobox' | 'date'
+export type FieldKind = 'text' | 'textarea' | 'select' | 'multiselect' | 'cascade' | 'radio' | 'checkbox' | 'combobox' | 'date' | 'file'
 
 export type ValueType = FieldKind | 'array'
 
@@ -57,12 +57,16 @@ export interface FormField {
   repeatGroupId?: string
   /** 字段附近提示文字（打分信号）。 */
   nearbyText?: string
+  /** 起止时间合在同一个区间选择器里。 */
+  range?: boolean
   /** 槽位判定（在内容脚本扫描时计算）。 */
   slot?: string
   slotStatus?: SlotDecisionStatus
   slotCandidates?: SlotScore[]
   /** 命中的站点规则 ID（F25），用于失败降权统计。 */
   ruleId?: string
+  /** 命中的已学别名（规范化后），用于成功/失败计数。 */
+  learnedAlias?: string
 }
 
 export interface PageContext {
@@ -75,11 +79,17 @@ export interface PageContext {
 export interface FillRequest {
   fieldId: string
   value: string
-  overwrite?: boolean
+  /**
+   * 只有用户明确触发的单字段填写/采用建议才允许覆盖现值。
+   * 自动填写请求不设置此项，写入层会保留用户已经填写的内容。
+   */
+  intent?: 'manual'
   source?: DataSource
   confidence?: number
   /** 目标槽位，用于同义值重试与结果记录。 */
   slot?: string
+  /** 本站曾经写成功的写法，先于档案原值尝试。 */
+  priorValues?: string[]
 }
 
 /** 机器可读失败原因码（F14）。 */
@@ -164,7 +174,8 @@ export interface ResolvedField {
  */
 export interface SlotSuggestion {
   fieldId: string
-  slot: string
+  /** 本地字段本体能表达时返回；知识库自定义字段可只引用 factId。 */
+  slot?: string
   confidence: number
   reason: string
   factId?: string
@@ -177,8 +188,11 @@ export interface SiteRule {
   domain: string
   urlPattern?: string
   fieldFingerprint: string
+  /** 用户确认后，同站相同标签（可限板块）都按这个槽位，不只能命中当前指纹。 */
+  labelKey?: string
+  sectionId?: string
   slot: string
-  origin: 'user-correction' | 'builtin' | 'imported'
+  origin: 'user-correction' | 'builtin' | 'imported' | 'ai' | 'fill'
   hitCount: number
   failCount: number
   disabled: boolean
@@ -200,13 +214,29 @@ export interface BackupPayload {
   siteRules?: SiteRule[]
   /** 学到的字段别名（措辞 → 槽位），不含个人数据。 */
   learnedAliases?: LearnedAlias[]
+  /** 本站写成功过的日期格式和选项说法，不含档案原值以外的个人数据映射键。 */
+  fillRecipes?: FillRecipe[]
+}
+
+/** 某站点某槽位写成功过的格式。options.from 是规范化后的档案值，to 是页面上的写法。 */
+export interface FillRecipe {
+  domain: string
+  slot: string
+  dateFormat?: string
+  options: Array<{ from: string; to: string }>
+  updatedAt: string
 }
 
 /** 学到的字段别名：某措辞（如「名字」）对应某槽位。 */
 export interface LearnedAlias {
   alias: string
   slot: string
+  /** 有值时只在这个板块里生效。跨板块同名标签（开始时间）必须带板块。 */
+  sectionId?: string
   hitCount: number
+  /** 用这个别名填写失败的次数。失败明显多于命中时停用。 */
+  failCount?: number
+  disabled?: boolean
   updatedAt: string
 }
 

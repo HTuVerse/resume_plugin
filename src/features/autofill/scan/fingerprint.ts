@@ -52,22 +52,30 @@ export interface FingerprintInput {
   label: string
   kind: string
   repeatIndex?: number
+  /** 已识别板块。同名标签在不同板块里必须是不同指纹。 */
+  sectionId?: string
 }
 
 /**
  * 生成字段指纹。保留可读前缀便于调试与评测标注，
  * 如 `姓名.text#1-a3f9c1`。
+ *
+ * 有稳定 name/id 或标签时不再把 DOM 层级写进指纹。
+ * 外层多包一层 div 不会让已经学会的站点规则失效。
+ * 两者都没有时才退回结构路径，避免两个空白控件撞成同一个。
  */
 export function fieldFingerprint(input: FingerprintInput): string {
-  const { element, label, kind, repeatIndex } = input
+  const { element, label, kind, repeatIndex, sectionId } = input
   const name = element.getAttribute('name') || ''
   const id = element.id && !isVolatileId(element.id) ? element.id : ''
   const stableAttr = name || id
   const labelNorm = normalize(label)
+  const structure = stableAttr || labelNorm ? '' : structuralPath(element)
   const material = [
-    structuralPath(element),
+    structure,
     stableAttr,
-    shortHash(labelNorm),
+    labelNorm,
+    sectionId || '',
     kind,
     String(repeatIndex ?? 0)
   ].join('|')

@@ -290,6 +290,39 @@ export const SLOTS: SlotDef[] = [
     valueType: 'longtext', repeatable: true, sensitive: false
   },
 
+  // ─── 工作经历（可重复，与实习分开）─────────────────────────
+  {
+    id: 'work.startDate', section: 'work',
+    aliases: ['开始时间', '入职时间', '起始时间'],
+    valueType: 'month', repeatable: true, sensitive: false
+  },
+  {
+    id: 'work.endDate', section: 'work',
+    aliases: ['结束时间', '离职时间', '终止时间'],
+    valueType: 'month', repeatable: true, sensitive: false
+  },
+  {
+    id: 'work.company', section: 'work',
+    aliases: ['企业名称', '公司名称', '公司', '单位名称', '工作单位', '单位', '雇主'],
+    patterns: [/^(company|employer)/i],
+    attrAliases: ['company', 'employer'],
+    excludePatterns: [/家庭|父|母|成员|证明人|颁发|实习/],
+    valueType: 'text', repeatable: true, sensitive: false
+  },
+  {
+    id: 'work.position', section: 'work',
+    aliases: ['职位名称', '职位', '岗位', '岗位名称', '职务', '担任职务'],
+    patterns: [/^(position|job\s*title|role)$/i],
+    attrAliases: ['position', 'jobtitle'],
+    excludePatterns: [/项目|证明人|期望|意向|活动/],
+    valueType: 'text', repeatable: true, sensitive: false
+  },
+  {
+    id: 'work.description', section: 'work',
+    aliases: ['工作描述', '工作内容', '工作职责', '主要职责', '主要工作', '经历描述', '职责描述'],
+    valueType: 'longtext', repeatable: true, sensitive: false
+  },
+
   // ─── 实习经历（可重复）─────────────────────────────────────
   {
     id: 'internship.startDate', section: 'internship',

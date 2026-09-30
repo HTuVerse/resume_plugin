@@ -3,7 +3,8 @@ import type { FormField, SiteRule } from '../../../domain/types'
 import { normalize } from '../../../shared/normalize'
 import type { LearnedAlias } from '../../ontology/learnedAliases'
 import { isPlaceholderOption } from '../../ontology/optionMatch'
-import { SLOTS, aliasHit, legacyAliasHit, slotById } from '../../ontology/slotRegistry'
+import { SLOTS, aliasHit, aliasSectionCount, legacyAliasHit, slotById } from '../../ontology/slotRegistry'
+import { findSiteRule } from '../../siteRules/ruleStore'
 import { sameValue } from '../../ontology/synonyms'
 
 /**
@@ -142,12 +143,14 @@ function collectSignals(field: FormField, slot: SlotDef): CollectedSignals {
     return { excluded: true, values: {} }
   }
 
+  const exactLabel = Boolean(label) && (aliasHit(slot, label) || (field.sectionId === slot.section && legacyAliasHit(slot, label)))
   const weakLabel = field.labelSource === 'sibling' || field.labelSource === 'placeholder'
-  const labelFactor = weakLabel ? WEAK_LABEL_FACTOR : 1
+  // 别名全等时不再因为标签来自兄弟节点或占位符而降权。降权只作用于正则这种非全等命中。
+  const labelFactor = weakLabel && !exactLabel ? WEAK_LABEL_FACTOR : 1
 
   const values: Record<string, number | null> = {
     labelMatch: label
-      ? ((aliasHit(slot, label) || (field.sectionId === slot.section && legacyAliasHit(slot, label))) ? labelFactor : patternHit(slot, label) ? 0.75 * labelFactor : 0)
+      ? (exactLabel ? labelFactor : patternHit(slot, label) ? 0.75 * labelFactor : 0)
       : null,
     attrAlias: attrAliasSignal(slot, field),
     enumSignature: enumSignatureSignal(slot, field),
@@ -167,17 +170,48 @@ export interface ScoreContext {
 }
 
 /** 对单个字段给出全部槽位的打分（降序）。 */
+function findLearned(field: FormField, aliases: LearnedAlias[] | undefined): LearnedAlias | undefined {
+  const labelKey = normalize(field.label)
+  if (!labelKey || !aliases?.length) return undefined
+  const exact = aliases.filter(item => !item.disabled && normalize(item.alias) === labelKey && slotById(item.slot))
+  const scoped = field.sectionId ? exact.find(item => item.sectionId === field.sectionId) : undefined
+  if (scoped) return scoped
+  const global = exact.find(item => !item.sectionId)
+  if (global) return global
+  if (!field.sectionId || labelKey.length > 20) return undefined
+  const loose = aliases.filter(item => {
+    if (item.disabled || item.sectionId !== field.sectionId) return false
+    const alias = normalize(item.alias)
+    if (alias.length < 4 || alias.length > 12 || alias === labelKey) return false
+    const slot = slotById(item.slot)
+    if (!slot || slot.section !== field.sectionId) return false
+    if (slot.excludePatterns?.some(pattern => pattern.test(field.label))) return false
+    const short = alias.length <= labelKey.length ? alias : labelKey
+    const long = short === alias ? labelKey : alias
+    return long.includes(short) && long.length - short.length <= 4
+  })
+  const slots = new Set(loose.map(item => item.slot))
+  return slots.size === 1 ? loose[0] : undefined
+}
+
 export function scoreFieldSlots(field: FormField, context: ScoreContext = {}): SlotScore[] {
-  // 站点规则短路（F25）：命中且未被降权则直接锁定槽位
-  const rule = context.siteRules?.find(item => !item.disabled && item.fieldFingerprint === field.fingerprint)
+  // 站点规则短路（F25）：指纹优先，其次是用户确认过的同类标签。
+  const rule = findSiteRule(context.siteRules, field)
   if (rule) {
     return [{ slot: rule.slot, score: 1, locked: true, signals: { siteRule: 1 } }]
   }
-  // 学到的别名：字段标签与已学习措辞全等即锁定（跨站点生效）。
-  // 页面板块已经认出来时，别名槽位必须属于这一板块，不能把「开始时间」从项目锁到实习。
-  const learned = context.learnedAliases?.find(item => item.alias === field.label.trim() && slotById(item.slot))
+  // 学到的别名：全等锁定。带板块的别名只在该板块生效。
+  // 同一板块里，短别名可以盖住多出来的几个字（毕业院校 → 毕业院校名称）。
+  const learned = findLearned(field, context.learnedAliases)
   const learnedSlot = learned ? slotById(learned.slot) : undefined
-  if (learned && learnedSlot && (!field.sectionId || learnedSlot.section === field.sectionId)) {
+  const learnedApplies = Boolean(
+    learned && learnedSlot
+    && (learned.sectionId
+      ? field.sectionId === learned.sectionId
+      : (!field.sectionId || learnedSlot.section === field.sectionId)
+        && (field.sectionId || aliasSectionCount(field.label) < 2))
+  )
+  if (learnedApplies && learned) {
     return [{ slot: learned.slot, score: 1, locked: true, signals: { learnedAlias: 1 } }]
   }
   const scored: SlotScore[] = []
@@ -200,16 +234,62 @@ export function scoreFieldSlots(field: FormField, context: ScoreContext = {}): S
   return scored.sort((a, b) => b.score - a.score)
 }
 
+function inSection(candidate: SlotScore, sectionId: string | undefined): boolean {
+  if (!sectionId) return true
+  return slotById(candidate.slot)?.section === sectionId
+}
+
+function clearMargin(top: SlotScore, scores: SlotScore[]): boolean {
+  const second = scores.find(candidate => candidate.slot !== top.slot)
+  return !second || top.score - second.score >= MARGIN
+}
+
 /**
- * 决策：只有「字段名精确命中」才自动填写，其余一律留空（用户要求精确匹配）。
- *
- * 精确来源有三种，都会把得分锁定为 1：
- * - 字段标签与槽位别名规范化全等（labelMatch = 1，如 姓名 / 名字 / 手机号）；
- * - 学到的别名（learnedAlias，用户在面板中手动确认后记住的措辞）；
- * - 该站点已学习的规则（siteRule）。
- * 页面板块已经认出来时，精确命中必须落在这个板块里。
- * 唯一命中但属于别的板块时不采用，避免同名字段串板块。
- * 区块未知时，弱信号仍不参与自动判定。
+ * 板块内（或全局唯一）的正则命中。要求 labelMatch ≥ 0.75 且总分 ≥ T_HIGH，
+ * 并与第二名拉开 MARGIN。兄弟节点上的非全等标签已被降权，到不了这条线。
+ */
+function patternDecision(scores: SlotScore[], sectionId?: string): SlotScore | undefined {
+  const hits = scores.filter(candidate => (candidate.signals.labelMatch || 0) >= 0.75 && candidate.score >= T_HIGH && inSection(candidate, sectionId))
+  if (hits.length !== 1) return undefined
+  return clearMargin(hits[0], scores) ? hits[0] : undefined
+}
+
+/**
+ * name / autocomplete 唯一命中，且没有别的槽位抢同一个属性。
+ * 页面已经认出板块时，槽位必须落在这个板块里。
+ */
+function attrDecision(scores: SlotScore[], sectionId?: string): SlotScore | undefined {
+  const hits = scores.filter(candidate => candidate.signals.attrAlias === 1 && inSection(candidate, sectionId))
+  const slots = new Set(hits.map(candidate => candidate.slot))
+  if (slots.size !== 1) return undefined
+  const exact = scores.find(candidate => candidate.signals.labelMatch === 1)
+  if (exact && exact.slot !== hits[0].slot) return undefined
+  return hits[0]
+}
+
+/**
+ * 选项集合能唯一反推槽位。
+ * 有板块时只在该板块里认；没有板块时，全局只对上一个槽位，并且和第二名拉开差距，才解析。
+ * 同一套选项对上两个槽位（最高学历和学历）时不猜。
+ */
+function enumDecision(scores: SlotScore[], sectionId?: string): SlotScore | undefined {
+  const hits = scores.filter(candidate => (candidate.signals.enumSignature || 0) >= 0.67 && inSection(candidate, sectionId))
+  if (hits.length !== 1) return undefined
+  const chosen = hits[0]
+  if (sectionId) {
+    const top = scores[0]
+    if (top && top.slot !== chosen.slot && top.score > chosen.score) return undefined
+    return chosen
+  }
+  return clearMargin(chosen, scores) ? chosen : undefined
+}
+
+/**
+ * 决策顺序：
+ * 1. 站点规则、学到的别名（锁定）；
+ * 2. 标签与槽位别名全等，且落在已识别板块内；同名多板块且板块未知则不猜；
+ * 3. 高置信正则（毕业院校名称）、唯一的 name/autocomplete，或唯一的选项签名（男/女）。
+ * 乱码标签、多个槽位共用的 name、对不上板块的唯一别名，仍然留空。
  */
 export function decideSlot(scores: SlotScore[], sectionId?: string): SlotDecision {
   const candidates = scores.slice(0, 5)
@@ -222,16 +302,22 @@ export function decideSlot(scores: SlotScore[], sectionId?: string): SlotDecisio
   }
   const exactAll = scores.filter(candidate => candidate.signals.labelMatch === 1)
   if (sectionId) {
-    const inSection = exactAll.filter(candidate => slotById(candidate.slot)?.section === sectionId)
-    if (inSection.length === 1) return { status: 'resolved', slot: inSection[0].slot, candidates }
-    if (exactAll.length) return { status: inSection.length > 1 ? 'ambiguous' : 'unknown', candidates }
+    const inExactSection = exactAll.filter(candidate => slotById(candidate.slot)?.section === sectionId)
+    if (inExactSection.length === 1) return { status: 'resolved', slot: inExactSection[0].slot, candidates }
+    if (exactAll.length) return { status: inExactSection.length > 1 ? 'ambiguous' : 'unknown', candidates }
   }
   const exact = candidates.filter(candidate => candidate.signals.labelMatch === 1)
   if (exact.length === 1) return { status: 'resolved', slot: exact[0].slot, candidates }
   // 同一标签精确命中多个槽位（如「开始时间」同时在项目、实习、校内活动）：
   // 仅当字段所在板块能唯一消解时才自动填，否则不猜
-  const inSection = exact.filter(candidate => candidate.signals.sectionMatch === 1)
-  if (inSection.length === 1) return { status: 'resolved', slot: inSection[0].slot, candidates }
+  const exactInSection = exact.filter(candidate => candidate.signals.sectionMatch === 1)
+  if (exactInSection.length === 1) return { status: 'resolved', slot: exactInSection[0].slot, candidates }
   if (exact.length > 1) return { status: 'ambiguous', candidates }
+  const pattern = patternDecision(scores, sectionId)
+  if (pattern) return { status: 'resolved', slot: pattern.slot, candidates }
+  const attributed = attrDecision(scores, sectionId)
+  if (attributed) return { status: 'resolved', slot: attributed.slot, candidates }
+  const enumerated = enumDecision(scores, sectionId)
+  if (enumerated) return { status: 'resolved', slot: enumerated.slot, candidates }
   return { status: 'unknown', candidates }
 }

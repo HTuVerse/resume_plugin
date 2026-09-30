@@ -1,12 +1,98 @@
 import type { FillReasonCode } from '../../../domain/types'
 import type { FieldRef } from '../scan/collector'
 import { readCurrentValue } from '../scan/collector'
-import { matchOption } from '../../ontology/optionMatch'
+import { isPlaceholderOption, matchOption, plainChoiceText } from '../../ontology/optionMatch'
 import { booleanValue } from '../../ontology/synonyms'
-import { normalizeDateValue } from '../../ontology/validators'
+import { isOngoingDate, normalizeDateValue, splitOngoingRange } from '../../ontology/validators'
 import { optionLabel } from '../scan/labelResolver'
-import { dispatchFieldEvents, isElementVisible, pollUntil, setNativeChecked, setNativeSelect, setNativeText, wait } from './domUtils'
+import { dispatchFieldEvents, pollUntil, setNativeChecked, setNativeSelect, setNativeText, wait } from './domUtils'
 import { popupOptions, watchForPopup } from './popupLocator'
+
+/** 按通用分隔符拆开多级值。连写的行政区名称再按后缀切一刀，这只用于拆字。 */
+export function splitCascadeValue(value: string): string[] {
+  const trimmed = value.trim()
+  if (!trimmed) return []
+  const bySeparator = trimmed.split(/\s*[/|>»→\-—、,，|]\s*/).map(item => item.trim()).filter(Boolean)
+  if (bySeparator.length > 1) return bySeparator
+  const bySpace = trimmed.split(/\s+/).map(item => item.trim()).filter(Boolean)
+  if (bySpace.length > 1 && bySpace.length <= 4 && bySpace.every(part => part.length >= 2 && part.length <= 20)) return bySpace
+  const byRegion = trimmed.match(/[^省市区县旗盟]+?(?:省|市|区|县|旗|盟|自治区|自治州|自治县)/g)
+  if (byRegion && byRegion.length > 1) return byRegion.map(item => item.trim())
+  return [trimmed]
+}
+
+function optionText(node: HTMLElement): string {
+  return plainChoiceText(node.textContent || '')
+}
+
+function realOptions(nodes: HTMLElement[]): HTMLElement[] {
+  return nodes.filter(node => {
+    const text = optionText(node)
+    return Boolean(text) && !isPlaceholderOption(text)
+  })
+}
+
+type OptionPick = { status: 'found'; node: HTMLElement } | { status: 'missing' } | { status: 'ambiguous' }
+
+function pickOption(nodes: HTMLElement[], value: string): OptionPick {
+  const match = matchOption(nodes.map(optionText), value)
+  if (match.ambiguous) return { status: 'ambiguous' }
+  if (match.index < 0 || !nodes[match.index]) return { status: 'missing' }
+  return { status: 'found', node: nodes[match.index] }
+}
+
+/**
+ * 点中一级之后，只有可见选项的文字变了才点下一级。
+ * 同一列表被换掉，或多出一批新选项，都算下一级。不看组件库的列名。
+ */
+async function stepThroughOptions(scope: HTMLElement, value: string, input: HTMLInputElement | null): Promise<WriteAttempt> {
+  const levels = splitCascadeValue(value)
+  let host = scope
+  const nodesNow = () => realOptions(popupOptions(host.isConnected ? host : document.body))
+  const full = pickOption(nodesNow(), value)
+  if (full.status === 'ambiguous') return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
+  if (full.status === 'found') {
+    clickElement(full.node)
+    await wait(120)
+    return { applied: true }
+  }
+  if (levels.length <= 1) return { applied: false, reasonCode: 'no-matching-option' }
+
+  let previousTexts: string[] = []
+  for (let level = 0; level < levels.length; level += 1) {
+    const poolFor = () => {
+      const pool = nodesNow()
+      if (!level || !previousTexts.length) return pool
+      const fresh = pool.filter(node => !previousTexts.includes(optionText(node)))
+      return fresh.length ? fresh : pool
+    }
+    let picked = pickOption(poolFor(), levels[level])
+    if (picked.status === 'missing' && input && !input.readOnly) {
+      setNativeText(input, levels[level])
+      await wait(320)
+      picked = pickOption(poolFor(), levels[level])
+    }
+    if (picked.status === 'ambiguous') return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
+    if (picked.status !== 'found') {
+      return { applied: false, reasonCode: 'no-matching-option', detail: `第 ${level + 1} 级找不到「${levels[level]}」` }
+    }
+    previousTexts = nodesNow().map(optionText)
+    clickElement(picked.node)
+    if (level === levels.length - 1) {
+      await wait(120)
+      return { applied: true }
+    }
+    const nextHost = await pollUntil(() => {
+      const current = host.isConnected ? host : document.body
+      const texts = realOptions(popupOptions(current)).map(optionText)
+      if (!texts.length || texts.join('\n') === previousTexts.join('\n')) return null
+      return current
+    }, 1500)
+    if (!nextHost) return { applied: false, reasonCode: 'option-list-not-found', detail: '下一级未出现' }
+    host = nextHost
+  }
+  return { applied: true }
+}
 
 /**
  * 控件识别器（ControlRecognizer，TECH_DESIGN §8.2）。
@@ -38,6 +124,55 @@ export interface ControlRecognizer {
   settleTimeoutMs?: number
 }
 
+function editorWindow(element: HTMLElement): Window {
+  const root = element.getRootNode()
+  if (root instanceof Document && root.defaultView) return root.defaultView
+  return window
+}
+
+/** Quill / TinyMCE / UEditor 走编辑器 API；普通 contenteditable 用选区插入，避免只改 DOM、提交仍是空的。 */
+function writeRichText(element: HTMLElement, value: string): boolean {
+  const host = element.closest('.ql-container') || element.closest('.ql-editor')?.parentElement
+  const quill = (host as { __quill?: { setText: (text: string) => void } } | null)?.__quill
+    || (element as { __quill?: { setText: (text: string) => void } }).__quill
+  if (quill?.setText) {
+    quill.setText(value)
+    return true
+  }
+  const view = editorWindow(element) as Window & {
+    tinymce?: { get: (id: string) => { setContent: (html: string) => void } | null }
+    UE?: { getEditor?: (id: string) => { setContent: (html: string) => void } | null }
+  }
+  const editorId = element.id
+  const tiny = editorId ? view.tinymce?.get(editorId) : null
+  if (tiny?.setContent) {
+    tiny.setContent(value.replace(/\n/g, '<br>'))
+    return true
+  }
+  const ueditor = editorId ? view.UE?.getEditor?.(editorId) : null
+  if (ueditor?.setContent) {
+    ueditor.setContent(value)
+    return true
+  }
+  if (!element.isContentEditable && element.getAttribute('role') !== 'textbox') return false
+  element.focus()
+  const doc = view.document
+  const selection = view.getSelection?.()
+  if (selection && doc) {
+    const range = doc.createRange()
+    range.selectNodeContents(element)
+    selection.removeAllRanges()
+    selection.addRange(range)
+    if (doc.execCommand?.('insertText', false, value)) {
+      element.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }))
+      return true
+    }
+  }
+  element.textContent = value
+  dispatchFieldEvents(element)
+  return true
+}
+
 function clickElement(element: HTMLElement): void {
   const options: MouseEventInit = { bubbles: true, cancelable: true }
   element.dispatchEvent(new MouseEvent('pointerdown', options))
@@ -64,11 +199,7 @@ const textRecognizer: ControlRecognizer = {
       setNativeText(element, value)
       return { applied: true }
     }
-    if (element.isContentEditable) {
-      element.textContent = value
-      dispatchFieldEvents(element)
-      return { applied: true }
-    }
+    if (writeRichText(element, value)) return { applied: true }
     return { applied: false, reasonCode: 'unsupported-control' }
   },
   async restore(ctx, previous) {
@@ -101,7 +232,13 @@ const nativeSelectRecognizer: ControlRecognizer = {
       return { applied: true }
     }
     const match = matchOption(options.map(option => option.text), value)
-    if (match.index < 0) return { applied: false, reasonCode: 'no-matching-option' }
+    if (match.index < 0) {
+      const levels = splitCascadeValue(value)
+      const hidden = selectIsHidden(select)
+      const list = hidden ? listsBesideSelect(select).find(item => realOptions(popupOptions(item)).length) : undefined
+      if (levels.length > 1 && list) return stepThroughOptions(list, value, null)
+      return { applied: false, reasonCode: 'no-matching-option' }
+    }
     const option = options[match.index]
     option.selected = true
     select.selectedIndex = match.index
@@ -141,16 +278,50 @@ function formatNativeTemporal(input: HTMLInputElement, value: string): string {
   return date
 }
 
-/** 原生 select 被藏起来时，旁边的自定义列表不会跟着 value 变，要点可见项。 */
-function revealHiddenSelectOption(select: HTMLSelectElement, label: string): void {
-  const style = getComputedStyle(select)
-  if (style.display !== 'none' && style.visibility !== 'hidden') return
+const LIST_SELECTOR = 'ul,[role="listbox"],[class*="dropdown"],[class*="options"]'
+
+function pushList(lists: HTMLElement[], node: HTMLElement | null | undefined): void {
+  if (!node || lists.includes(node)) return
+  lists.push(node)
+}
+
+/** 藏起来的 select 旁边的可见列表：aria-controls、同级、父级的兄弟。 */
+function listsBesideSelect(select: HTMLSelectElement): HTMLElement[] {
+  const lists: HTMLElement[] = []
+  const owned = select.getAttribute('aria-controls')
+  if (owned) pushList(lists, select.ownerDocument.getElementById(owned))
   const host = select.parentElement
-  const list = host?.querySelector<HTMLElement>('ul,[role="listbox"],[class*="dropdown"],[class*="options"]')
-  if (!list) return
+  if (host?.matches(LIST_SELECTOR)) pushList(lists, host)
+  pushList(lists, host?.querySelector<HTMLElement>(LIST_SELECTOR))
+  const consider = (sibling: Element | null) => {
+    if (!(sibling instanceof HTMLElement) || sibling === select || sibling === host) return
+    if (sibling.matches(LIST_SELECTOR)) pushList(lists, sibling)
+    pushList(lists, sibling.querySelector<HTMLElement>(LIST_SELECTOR))
+  }
+  if (host) Array.from(host.children).forEach(consider)
+  if (host?.parentElement) Array.from(host.parentElement.children).forEach(consider)
+  return lists
+}
+
+function clickMatchingItem(list: HTMLElement, label: string): boolean {
   const items = Array.from(list.querySelectorAll<HTMLElement>('li,[role="option"]'))
   const match = matchOption(items.map(item => item.textContent?.trim() || ''), label)
-  if (match.index >= 0 && !match.ambiguous && items[match.index]) clickElement(items[match.index])
+  if (match.index < 0 || match.ambiguous || !items[match.index]) return false
+  clickElement(items[match.index])
+  return true
+}
+
+function selectIsHidden(select: HTMLSelectElement): boolean {
+  const style = getComputedStyle(select)
+  return style.display === 'none' || style.visibility === 'hidden' || !select.getClientRects().length
+}
+
+/** 原生 select 被藏起来时，旁边的自定义列表不会跟着 value 变，要点可见项。 */
+function revealHiddenSelectOption(select: HTMLSelectElement, label: string): void {
+  if (!selectIsHidden(select)) return
+  for (const list of listsBesideSelect(select)) {
+    if (clickMatchingItem(list, label)) return
+  }
 }
 
 // ─── 原生日期 / 时间 ─────────────────────────────────────────
@@ -173,10 +344,28 @@ const nativeDateRecognizer: ControlRecognizer = {
 
 // ─── radio / checkbox ────────────────────────────────────────
 
+const RADIO_HIT = '.el-radio__inner,.el-radio-button__inner,.ant-radio-inner,.ant-radio-button,.arco-radio-mask,.van-radio__icon,.t-radio__input,.semi-radio-inner,.n-radio__dot,.el-radio__label'
+
+/** 只包住当前这一项的那一层。整题的 label 里有多个选项时不能点到它，否则总会点中第一项。 */
+function exclusiveOptionRoot(radio: HTMLElement): HTMLElement {
+  let node = radio.parentElement
+  let best: HTMLElement = radio
+  while (node && node !== document.body && node !== document.documentElement) {
+    const inputs = node.querySelectorAll('input[type="radio"],input[type="checkbox"],[role="radio"],[role="checkbox"]')
+    const foreign = Array.from(inputs).some(item => item !== radio && !radio.contains(item) && !item.contains(radio))
+    if (foreign) break
+    best = node
+    node = node.parentElement
+  }
+  return best
+}
+
+/** 点可见的选项根，让组件自己的点击处理函数跑。点不中再改原生 checked。 */
 function activateRadio(radio: HTMLInputElement): boolean {
-  const wrapper = radio.closest('label,.el-radio,.el-radio-button,.ant-radio-wrapper,.ant-radio-button-wrapper,.arco-radio,[role="radio"]') as HTMLElement | null
-  const visible = wrapper?.querySelector<HTMLElement>('.el-radio__inner,.el-radio-button__inner,.ant-radio-inner,.ant-radio-button,.arco-radio-mask,.el-radio__label') || wrapper
-  if (visible) clickElement(visible)
+  const wrapper = exclusiveOptionRoot(radio)
+  const hit = wrapper.querySelector<HTMLElement>(RADIO_HIT)
+  const target = hit && hit !== radio ? hit : wrapper !== radio ? wrapper : null
+  if (target) clickElement(target)
   else radio.click()
   if (!radio.checked) setNativeChecked(radio, true)
   return radio.checked
@@ -200,7 +389,7 @@ const choiceRecognizer: ControlRecognizer = {
       }
       const target = nodes[match.index]
       if (target instanceof HTMLInputElement) return { applied: activateRadio(target) }
-      target.click()
+      clickElement(target)
       target.setAttribute('aria-checked', 'true')
       for (const other of nodes) {
         if (other !== target) other.setAttribute('aria-checked', 'false')
@@ -378,8 +567,30 @@ function clickConfirm(popup: HTMLElement): void {
   if (confirm) clickElement(confirm)
 }
 
+function clickOngoing(scope: ParentNode): boolean {
+  const node = Array.from(scope.querySelectorAll<HTMLElement>('button,a,span,label,li,div'))
+    .find(item => /^(至今|现在|目前|在读)$/.test((item.textContent || '').replace(/\s+/g, '')))
+  if (!node) return false
+  clickElement(node)
+  return true
+}
+
+function rangeInputs(element: HTMLElement): HTMLInputElement[] {
+  const host = element.closest('.ant-picker-range,.el-range-editor,.el-date-editor--daterange,.el-date-editor--monthrange')
+  if (!host) return []
+  return Array.from(host.querySelectorAll<HTMLInputElement>('input:not([type="hidden"])'))
+}
+
+/** 带连字符的学校名、专业名不要拆成级联。行政区或明确的多级分隔符才逐级点。 */
+function shouldStepCascade(value: string): boolean {
+  const levels = splitCascadeValue(value)
+  if (levels.length <= 1) return false
+  return /省|市|区|县|自治区/.test(value) || /[/|>»→]/.test(value)
+}
+
 /** 打开面板后点中对应的日、月或时刻。点不到时返回 false，交给输入框兜底。 */
 async function chooseInPicker(popup: HTMLElement, value: string, input: HTMLInputElement): Promise<boolean> {
+  if (isOngoingDate(value)) return clickOngoing(popup)
   const parts = parseDateParts(value)
   if (!parts) return false
   const hints = [input.getAttribute('format'), input.placeholder].filter(Boolean).join(' ')
@@ -414,6 +625,20 @@ const datePickerRecognizer: ControlRecognizer = {
     const watch = watchForPopup(ctx.ref.element)
     try {
       const before = input.value.trim()
+      const pair = rangeInputs(input)
+      const range = pair.length >= 2 ? splitOngoingRange(value) : null
+      if (range?.start && range.end && pair.length >= 2) {
+        setNativeText(pair[0], formatDateForInput(pair[0], range.start))
+        if (isOngoingDate(range.end)) {
+          clickElement(pair[1])
+          const popup = await watch.locate()
+          if (!popup || !clickOngoing(popup)) setNativeText(pair[1], range.end)
+        } else {
+          setNativeText(pair[1], formatDateForInput(pair[1], range.end))
+        }
+        pair[1].blur()
+        return { applied: true }
+      }
       input.focus()
       clickElement(input.closest('.ant-picker,.el-date-editor,.arco-picker') || input)
       let picked = false
@@ -458,7 +683,17 @@ const datePickerRecognizer: ControlRecognizer = {
 
 // ─── 自定义下拉（combobox，含虚拟滚动 F18）──────────────────
 
-const MAX_FILTER_ATTEMPTS = 3
+const MAX_FILTER_ATTEMPTS = 4
+const MAX_SCROLL_ATTEMPTS = 6
+
+async function loadMoreOptions(popup: HTMLElement): Promise<void> {
+  const marked = popup.querySelector<HTMLElement>('.rc-virtual-list-holder,.el-scrollbar__wrap,.arco-virtual-list,.semi-select-option-list')
+  const scroller = marked || Array.from(popup.querySelectorAll<HTMLElement>('*')).find(node => node.scrollHeight > node.clientHeight + 24)
+  if (!scroller) return
+  scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(scroller.clientHeight, 120))
+  scroller.dispatchEvent(new Event('scroll', { bubbles: true }))
+  await wait(180)
+}
 
 const comboboxRecognizer: ControlRecognizer = {
   id: 'custom-combobox',
@@ -470,16 +705,22 @@ const comboboxRecognizer: ControlRecognizer = {
     const trigger = ctx.ref.element
     const watch = watchForPopup(trigger)
     try {
-      const clickable = trigger.querySelector<HTMLElement>('.ant-select-selector,.el-select__wrapper,.el-input__wrapper,.el-input,.arco-select-view,.n-base-selection,.ivu-select-selection') || trigger
+      const clickable = trigger.querySelector<HTMLElement>('.ant-select-selector,.el-select__wrapper,.el-input__wrapper,.el-input,.arco-select-view,.n-base-selection,.ivu-select-selection,.semi-select-selection,.t-select__wrap,.t-input__wrap') || trigger
       clickElement(clickable)
       const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
       const popup = await watch.locate()
       if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
 
-      // 输入筛选 → 重查 循环（对付虚拟滚动长列表）
-      for (let attempt = 0; attempt < MAX_FILTER_ATTEMPTS; attempt += 1) {
+      if (shouldStepCascade(value)) {
+        if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
+        return stepThroughOptions(popup, value, input)
+      }
+
+      // 输入筛选 → 滚动加载 → 重查（虚拟列表只渲染视口内的选项）
+      let scrolled = 0
+      for (let attempt = 0; attempt < MAX_FILTER_ATTEMPTS + MAX_SCROLL_ATTEMPTS; attempt += 1) {
         const options = popupOptions(popup)
-        const texts = options.map(option => option.textContent?.trim() || '')
+        const texts = options.map(option => optionText(option))
         const match = matchOption(texts, value)
         if (match.index >= 0 && !match.ambiguous) {
           const option = options[match.index]
@@ -493,6 +734,9 @@ const comboboxRecognizer: ControlRecognizer = {
         if (input && !input.readOnly && attempt < MAX_FILTER_ATTEMPTS - 1) {
           setNativeText(input, attempt === 0 ? value : value.slice(0, Math.max(1, value.length - attempt)))
           await wait(320)
+        } else if (scrolled < MAX_SCROLL_ATTEMPTS) {
+          scrolled += 1
+          await loadMoreOptions(popup)
         } else {
           break
         }
@@ -515,30 +759,7 @@ const comboboxRecognizer: ControlRecognizer = {
   }
 }
 
-// ─── 自定义级联（cascader，F12）─────────────────────────────
-
-/** 值按分隔符 / 行政区后缀智能拆分为层级数组。 */
-export function splitCascadeValue(value: string): string[] {
-  const bySeparator = value.split(/\s*[\/>»→\-—、,，]\s*/).map(item => item.trim()).filter(Boolean)
-  if (bySeparator.length > 1) return bySeparator
-  // 无显式分隔：按 省/市/区/县/旗/盟 后缀切
-  const byRegion = value.match(/[^省市区县旗盟]+?(?:省|市|区|县|旗|盟|自治区|自治州|自治县)/g)
-  if (byRegion && byRegion.length > 1) return byRegion.map(item => item.trim())
-  return [value.trim()]
-}
-
-const CASCADER_COLUMN_SELECTOR = '.ant-cascader-menu,.el-cascader-menu,.arco-cascader-panel-column,[class*="cascader"] ul,[role="menu"]'
-const CASCADER_OPTION_SELECTOR = '.ant-cascader-menu-item:not(.ant-cascader-menu-item-disabled),.el-cascader-node:not(.is-disabled),.arco-cascader-option,[role="menuitemcheckbox"],[role="menuitem"],li'
-
-function cascaderColumns(popup: HTMLElement): HTMLElement[] {
-  const columns = Array.from(popup.querySelectorAll<HTMLElement>(CASCADER_COLUMN_SELECTOR)).filter(isElementVisible)
-  return columns.filter(column => !columns.some(other => other !== column && column.contains(other)))
-}
-
-function columnOptions(column: HTMLElement): HTMLElement[] {
-  const options = Array.from(column.querySelectorAll<HTMLElement>(CASCADER_OPTION_SELECTOR)).filter(isElementVisible)
-  return options.filter(option => !options.some(other => other !== option && option.contains(other)))
-}
+// ─── 自定义级联（与普通下拉共用逐级点击）────────────────────
 
 const cascaderRecognizer: ControlRecognizer = {
   id: 'custom-cascader',
@@ -548,10 +769,8 @@ const cascaderRecognizer: ControlRecognizer = {
   read: ctx => readCurrentValue(ctx.ref),
   async write(ctx, value) {
     const trigger = ctx.ref.element
-    const levels = splitCascadeValue(value)
     const watch = watchForPopup(trigger)
     const rollback = async () => {
-      // 不留半成品：按 Escape 收起，再尝试点清除按钮
       trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
       const host = trigger.closest<HTMLElement>('.ant-cascader,.el-cascader') || trigger
       const clear = host.querySelector<HTMLElement>('.ant-select-clear,.el-input__clear,[class*="clear"]')
@@ -562,29 +781,11 @@ const cascaderRecognizer: ControlRecognizer = {
       clickElement(trigger)
       const popup = await watch.locate()
       if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
-
-      for (let level = 0; level < levels.length; level += 1) {
-        // 轮询等待第 level 列出现（不用固定 sleep）
-        const column = await pollUntil(() => {
-          const columns = cascaderColumns(popup.isConnected ? popup : document.body)
-          return columns.length > level ? columns[level] : (columns.length ? columns[columns.length - 1] : null)
-        }, 1500)
-        if (!column) {
-          await rollback()
-          return { applied: false, reasonCode: 'option-list-not-found', detail: `第 ${level + 1} 级选项未出现` }
-        }
-        const options = columnOptions(column)
-        const texts = options.map(option => option.textContent?.trim() || '')
-        const match = matchOption(texts, levels[level])
-        if (match.index < 0 || match.ambiguous) {
-          await rollback()
-          return { applied: false, reasonCode: 'no-matching-option', detail: `第 ${level + 1} 级找不到「${levels[level]}」` }
-        }
-        clickElement(options[match.index])
-        await wait(160)
-      }
-      await wait(150)
-      return { applied: true }
+      const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
+      if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
+      const stepped = await stepThroughOptions(popup, value, input)
+      if (!stepped.applied) await rollback()
+      return stepped
     } finally {
       watch.dispose()
     }

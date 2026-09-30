@@ -1,4 +1,6 @@
 import type { LabelSource } from '../../../domain/types'
+import { looksLikeFieldPrompt, plainChoiceText } from '../../ontology/optionMatch'
+import { sectionOfText } from '../../ontology/sections'
 
 /**
  * 标签抽取（从旧 content.labelOf 迁出，F02 前置）。
@@ -18,7 +20,95 @@ const FORM_ITEM_LABEL_SELECTOR = 'label,.ant-form-item-label,.el-form-item__labe
 const CHOICE_GROUP_SELECTOR = '[role="radiogroup"],[role="group"],.ant-radio-group,.el-radio-group,.arco-radio-group,.ant-checkbox-group,.el-checkbox-group,fieldset'
 
 function cleanText(text: string | null | undefined): string {
-  return String(text || '').replace(/\s+/g, ' ').replace(/[*＊:：]\s*$/, '').trim()
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    // 必填符既可能放在标签末尾（姓名 *），也可能像多数中文表单一样放在开头（* 姓名）。
+    // 在标签进入指纹、站点规则和槽位匹配前统一剥离，避免各下游各自猜测。
+    .replace(/^(?:[*＊]\s*)+(?:[:：]\s*)?/, '')
+    .replace(/(?:\s*[*＊:：])+\s*$/, '')
+    .trim()
+}
+
+/** basicSex、srcPlace 这种标识符不是给人看的字段名。 */
+export function isFieldIdentifier(text: string): boolean {
+  return /^[A-Za-z_][\w.-]*$/.test(text.trim())
+}
+
+function hasControl(element: HTMLElement): boolean {
+  return Boolean(element.querySelector('input,textarea,select,[role="combobox"],[role="textbox"],[role="spinbutton"],[role="radio"],[role="checkbox"],[contenteditable="true"]'))
+}
+
+/** 不含控件的短标题。带输入框的上一整行不能拿来当这一行的字段名。 */
+function labelOnlyText(element: HTMLElement): string {
+  if (hasControl(element)) return ''
+  const text = cleanText(element.textContent)
+  if (!text || text.length > 40 || looksLikeFieldPrompt(text) || isFieldIdentifier(text) || sectionOfText(text)) return ''
+  return text
+}
+
+/**
+ * 中文标题常常在输入框外层的前一个兄弟上，而不是直接挨着 input。
+ * 只接受没有控件的短文字，避免把上一题的「性别 男 女」整段借过来。
+ */
+export function nearbyLabel(element: HTMLElement): string {
+  let node: HTMLElement | null = element
+  for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+    let sibling: Element | null = node.previousElementSibling
+    for (let index = 0; sibling && index < 3; index += 1, sibling = sibling.previousElementSibling) {
+      if (!(sibling instanceof HTMLElement)) continue
+      const text = labelOnlyText(sibling)
+      if (text) return text
+    }
+  }
+  return ''
+}
+
+const PROMPT_PREFIX = /^(请选择|请输入|请填写|请搜索|选择或搜索|搜索或选择|点击选择)/
+
+/**
+ * 有的网站没有旁边的标题，字段名写在 placeholder 里。
+ * 「请选择性别」→「性别」，「选择或搜索生源（户籍）地」→「生源地」，「健康状况」保持原样。
+ * 剥完只剩提示语时返回空，避免把占位句本身当成字段名。
+ */
+export function labelFromPlaceholder(raw: string): string {
+  let text = cleanText(raw)
+  if (!text || isFieldIdentifier(text)) return ''
+  text = cleanText(text.replace(PROMPT_PREFIX, ''))
+  text = cleanText(text.replace(/[（(][^）)]*[）)]/g, ''))
+  if (!text || text.length > 40 || looksLikeFieldPrompt(text) || isFieldIdentifier(text)) return ''
+  return text
+}
+
+function acceptLabel(text: string, source: LabelSource): ResolvedLabel | null {
+  const cleaned = cleanText(text)
+  if (!cleaned) return null
+  const named = looksLikeFieldPrompt(cleaned) || isFieldIdentifier(cleaned) ? labelFromPlaceholder(cleaned) : cleaned
+  if (!named || isFieldIdentifier(named) || looksLikeFieldPrompt(named)) return null
+  return { text: named, source }
+}
+
+/**
+ * 题目被选项粘在一起时只留题目。
+ * 「性别 男 女 性别男女」→「性别」，「是否为学生干部 否 是」→「是否为学生干部」。
+ */
+export function questionText(text: string, options: string[]): string {
+  const compact = cleanText(text)
+  if (!compact) return ''
+  const tokens = options.map(option => cleanText(option)).filter(option => option.length > 0)
+  for (const option of [...tokens].sort((a, b) => b.length - a.length)) {
+    const pattern = new RegExp(`(?:^|[\\s/|、])${option.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[\\s/|、])`)
+    const match = pattern.exec(compact)
+    if (!match || match.index <= 0) continue
+    const head = cleanText(compact.slice(0, match.index))
+    if (head && !looksLikeFieldPrompt(head) && !isFieldIdentifier(head)) return head
+  }
+  const flat = compact.replace(/\s+/g, '')
+  const glued = tokens.join('')
+  if (glued.length > 1) {
+    const index = flat.indexOf(glued)
+    if (index > 0) return flat.slice(0, index)
+  }
+  return compact
 }
 
 export function resolveLabel(element: HTMLElement): ResolvedLabel {
@@ -26,52 +116,50 @@ export function resolveLabel(element: HTMLElement): ResolvedLabel {
   if ('labels' in element) {
     const labels = (element as HTMLInputElement).labels
     if (labels?.length) {
-      const text = cleanText(Array.from(labels).map(label => label.textContent || '').join(' '))
-      if (text) return { text, source: 'for' }
+      const accepted = acceptLabel(Array.from(labels).map(label => label.textContent || '').join(' '), 'for')
+      if (accepted) return accepted
     }
   }
   // 2. aria-label / aria-labelledby
-  const ariaLabel = cleanText(element.getAttribute('aria-label'))
-  if (ariaLabel) return { text: ariaLabel, source: 'aria' }
   const root = element.getRootNode() as Document | ShadowRoot
+  const ariaLabel = acceptLabel(element.getAttribute('aria-label') || '', 'aria')
+  if (ariaLabel) return ariaLabel
   const ariaIds = element.getAttribute('aria-labelledby')?.split(/\s+/) || []
-  const ariaText = cleanText(ariaIds.map(id => (root.getElementById?.(id))?.textContent || '').filter(Boolean).join(' '))
-  if (ariaText) return { text: ariaText, source: 'aria' }
+  const ariaText = acceptLabel(ariaIds.map(id => (root.getElementById?.(id))?.textContent || '').filter(Boolean).join(' '), 'aria')
+  if (ariaText) return ariaText
   // 3. 显式 label[for]（labels 属性对自定义控件可能不可用）
   if (element.id) {
     const associated = root.querySelector?.(`label[for="${CSS.escape(element.id)}"]`)
-    const text = cleanText(associated?.textContent)
-    if (text) return { text, source: 'for' }
+    const accepted = acceptLabel(associated?.textContent || '', 'for')
+    if (accepted) return accepted
   }
   const wrapped = element.closest('label')
   if (wrapped) {
-    const text = cleanText(wrapped.textContent)
-    if (text) return { text, source: 'for' }
+    const accepted = acceptLabel(wrapped.textContent || '', 'for')
+    if (accepted) return accepted
   }
   // 4. 表单项容器内的 label 节点
   const formItem = element.closest(FORM_ITEM_SELECTOR)
   if (formItem) {
     const nearby = formItem.querySelector(FORM_ITEM_LABEL_SELECTOR)
-    const text = cleanText(nearby?.textContent)
-    if (text) return { text, source: 'container' }
+    const accepted = acceptLabel(nearby?.textContent || '', 'container')
+    if (accepted) return accepted
   }
-  // 5. 兄弟节点（弱）
-  const parent = element.parentElement
-  const sibling = element.previousElementSibling || parent?.previousElementSibling
-  const siblingText = cleanText(sibling?.textContent)
-  if (siblingText && siblingText.length < 80) return { text: siblingText, source: 'sibling' }
-  // 6. placeholder / name（最弱）
-  const placeholder = cleanText(element.getAttribute('placeholder'))
-  if (placeholder) return { text: placeholder, source: 'placeholder' }
-  const name = cleanText(element.getAttribute('name'))
-  if (name) return { text: name, source: 'placeholder' }
+  // 5. 往上找不含控件的短标题（中文 label 常在再外一层）
+  const nearby = nearbyLabel(element)
+  if (nearby) return { text: nearby, source: 'sibling' }
+  // 6. 没有旁边的标题时，从 placeholder 里取出字段名。整句提示不原样留下。
+  const own = element.getAttribute('placeholder') || ''
+  const nested = element.querySelector('input[placeholder],textarea[placeholder]')?.getAttribute('placeholder') || ''
+  const fromPlaceholder = labelFromPlaceholder(own || nested)
+  if (fromPlaceholder) return { text: fromPlaceholder, source: 'placeholder' }
   return { text: '', source: 'none' }
 }
 
 const CODE_VALUE = /^(0|1|true|false|yes|no|y|n)$/i
 
 function shortOptionText(text: string): string {
-  const cleaned = cleanText(text)
+  const cleaned = plainChoiceText(cleanText(text))
   if (!cleaned || cleaned.length > 40 || CODE_VALUE.test(cleaned)) return ''
   return cleaned
 }
@@ -109,6 +197,11 @@ export function optionLabel(element: HTMLElement): string {
     const inputs = wrapper.querySelectorAll('input[type="radio"],input[type="checkbox"],[role="radio"]')
     const text = shortOptionText(wrapper.textContent || '')
     if (text && inputs.length <= 1) return text
+  }
+
+  if (!(element instanceof HTMLInputElement) && !(element instanceof HTMLSelectElement)) {
+    const own = shortOptionText(element.textContent || '')
+    if (own && !element.querySelector('input,select,textarea,[role="radio"],[role="checkbox"]')) return own
   }
 
   const sibling = element.nextElementSibling || element.previousElementSibling
@@ -149,8 +242,9 @@ export function questionLabel(element: HTMLElement): ResolvedLabel {
   if (legend) return { text: legend, source: 'container' }
   const aria = cleanText(group?.getAttribute('aria-label'))
   if (aria) return { text: aria, source: 'aria' }
-  const sibling = cleanText((group || element.parentElement)?.previousElementSibling?.textContent)
-  if (sibling && sibling.length < 40) return { text: sibling, source: 'sibling' }
+  const siblingNode = (group || element.parentElement)?.previousElementSibling
+  const sibling = siblingNode instanceof HTMLElement ? labelOnlyText(siblingNode) : ''
+  if (sibling) return { text: sibling, source: 'sibling' }
   return resolveLabel(element)
 }
 

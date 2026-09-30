@@ -15,6 +15,26 @@ export interface TypeCheckResult {
 
 const PHONE_PATTERN = /^1[3-9]\d{9}$/
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
+const ONGOING_DATE = /^(至今|现在|目前|在读|present|now|current)$/i
+
+/** 结束时间写成「至今 / 现在」，不是一个可解析的年月日。 */
+export function isOngoingDate(value: string): boolean {
+  return ONGOING_DATE.test(value.trim())
+}
+
+/**
+ * 区间选择器上的一对端点。
+ * 「2021-09至今」保留结束端；纯「至今」只有结束端；两个年份才拆成起止。
+ */
+export function splitOngoingRange(value: string): { start: string; end: string } | null {
+  const text = value.trim()
+  const marked = text.match(/^(.*?)(?:至|到|[-–—~～])?\s*(至今|现在|目前|在读|present|now|current)$/i)
+  if (marked?.[1].trim()) return { start: marked[1].trim(), end: marked[2] }
+  if (isOngoingDate(text)) return { start: '', end: text }
+  const parts = splitDateRange(text)
+  if (parts.length >= 2) return { start: parts[0], end: parts[1] }
+  return null
+}
 
 /**
  * 把「2021.9-2025.6」「2021年9月至2025年6月」这类区间串拆成独立日期串。
@@ -73,10 +93,12 @@ export function validateType(valueType: SlotValueType, value: string): TypeCheck
         ? { ok: true, value: trimmed }
         : { ok: false, value: trimmed, reason: '不是合法的邮箱地址' }
     case 'date':
+      if (isOngoingDate(trimmed)) return { ok: true, value: trimmed }
       return isParseableDate(trimmed)
         ? { ok: true, value: normalizeDateValue(trimmed, false) }
         : { ok: false, value: trimmed, reason: '无法解析为合法日期' }
     case 'month': {
+      if (isOngoingDate(trimmed)) return { ok: true, value: trimmed }
       const normalized = normalizeDateValue(trimmed, true)
       return /^(19|20)\d{2}-(0[1-9]|1[0-2])$/.test(normalized)
         ? { ok: true, value: normalized }

@@ -36,4 +36,10 @@ describe('matchOption（§6 选项匹配策略）', () => {
   it('全不中 → -1（不猜）', () => {
     expect(matchOption(['汉族', '回族'], '博士').index).toBe(-1)
   })
+  it('选项前面的方框和勾不参与比较', () => {
+    expect(matchOption(['口是', '口否'], '是').index).toBe(0)
+    expect(matchOption(['是', '否'], '口否').index).toBe(1)
+    expect(matchOption(['✓本科', '硕士'], '本科').index).toBe(0)
+    expect(matchOption(['口腔医学', '临床医学'], '口腔医学').index).toBe(0)
+  })
 })
