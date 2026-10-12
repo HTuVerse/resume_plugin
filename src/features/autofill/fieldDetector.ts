@@ -1,6 +1,14 @@
-import type { FieldKind } from '../../domain/types'
+import type { FieldKind, OptionCoverage } from '../../domain/types'
 import { isPlaceholderOption, plainChoiceText } from '../ontology/optionMatch'
 import { optionLabel } from './scan/labelResolver'
+import { controlOptionCoverage } from './control/optionCoverage'
+import { universalTypeFromFieldKind } from './control/model'
+import {
+  PLATFORM_CASCADE_SELECTOR,
+  PLATFORM_DATE_SELECTOR,
+  PLATFORM_OPTION_SELECTOR,
+  PLATFORM_SELECT_SELECTOR
+} from './platforms/registry'
 
 /**
  * 控件类型判定（R3 修复）：
@@ -8,11 +16,11 @@ import { optionLabel } from './scan/labelResolver'
  * - 组件库日期控件（ant-picker / el-date-editor）判为 date，走日期归一化。
  */
 
-const CUSTOM_CASCADER_SELECTOR = '.ant-cascader,.el-cascader,.arco-cascader,[class*="cascader"]'
-const CUSTOM_DATE_SELECTOR = '.ant-picker,.el-date-editor,.arco-picker,.ivu-date-picker,.n-date-picker,[class*="date-picker"],[class*="datepicker"]'
+const CUSTOM_CASCADER_SELECTOR = ['.ant-cascader,.el-cascader,.arco-cascader,[class*="cascader"]', PLATFORM_CASCADE_SELECTOR].filter(Boolean).join(',')
+const CUSTOM_DATE_SELECTOR = ['.ant-picker,.el-date-editor,.arco-picker,.ivu-date-picker,.n-date-picker,[class*="date-picker"],[class*="datepicker"]', PLATFORM_DATE_SELECTOR].filter(Boolean).join(',')
 const CUSTOM_TIME_SELECTOR = '.el-time-picker,.el-time-select,.ant-picker-time-panel,[class*="time-picker"],[class*="timepicker"]'
 const NATIVE_TEMPORAL = ['date', 'month', 'time', 'datetime-local', 'week']
-export const CUSTOM_SELECT_SELECTOR = '.ant-select,.el-select,.arco-select,.n-select,.ivu-select,.semi-select,.t-select'
+export const CUSTOM_SELECT_SELECTOR = ['.ant-select,.el-select,.arco-select,.n-select,.ivu-select,.semi-select,.t-select', PLATFORM_SELECT_SELECTOR].filter(Boolean).join(',')
 
 function hintText(element: HTMLElement): string {
   const className = typeof element.className === 'string' ? element.className : ''
@@ -29,7 +37,7 @@ export function isDateLikeControl(element: HTMLElement): boolean {
   return readonly && /时间/.test(hint)
 }
 
-const WIDGET_OPTION = '[role="option"],.ant-select-item-option,.el-select-dropdown__item,.arco-select-option,.n-base-select-option,.ivu-select-item,.t-select-option'
+const WIDGET_OPTION = ['[role="option"],.ant-select-item-option,.el-select-dropdown__item,.arco-select-option,.n-base-select-option,.ivu-select-item,.t-select-option', PLATFORM_OPTION_SELECTOR].filter(Boolean).join(',')
 
 /** 多选标签：Ant / Element 的 multiple 选择器，不是原生 select[multiple]。 */
 export function isCustomMultiselect(element: HTMLElement): boolean {
@@ -67,7 +75,7 @@ export function widgetOptions(element: HTMLElement): string[] {
 /** 组件库下拉，或只读且占位是「请选择」的输入。日期选择器优先归到日期。 */
 export function isSelectLikeControl(element: HTMLElement): boolean {
   if (isDateLikeControl(element)) return false
-  if (element.getAttribute('role') === 'combobox' || element.getAttribute('aria-haspopup') === 'listbox') return true
+  if (element.getAttribute('role') === 'combobox' || ['listbox', 'tree', 'menu'].includes(element.getAttribute('aria-haspopup') || '')) return true
   if (element.closest(CUSTOM_SELECT_SELECTOR) || element.closest(CUSTOM_CASCADER_SELECTOR)) return true
   return element instanceof HTMLInputElement && element.readOnly && /请选择/.test(element.getAttribute('placeholder') || '')
 }
@@ -79,6 +87,7 @@ export function detectFieldKind(element: HTMLElement, label: string, group: stri
     return /省|市|区|县|国家|地区|地址|所在地|居住地|province|city|district|region/i.test(`${label} ${group}`) ? 'cascade' : 'select'
   }
   if (element instanceof HTMLTextAreaElement) return 'textarea'
+  if (element.getAttribute('role') === 'checkbox' || element.getAttribute('role') === 'switch') return 'checkbox'
   if (element instanceof HTMLInputElement) {
     if (isDateLikeControl(element)) return 'date'
     if (element.type === 'radio') return 'radio'
@@ -95,6 +104,14 @@ export function detectFieldKind(element: HTMLElement, label: string, group: stri
   if (element.isContentEditable || element.getAttribute('role') === 'textbox') return 'textarea'
   if (element.getAttribute('role') === 'spinbutton') return 'text'
   return 'text'
+}
+
+/**
+ * 原生静态 select 与直接渲染的选项组可视为完整；自定义弹层只暴露当前
+ * 渲染片段，尤其是虚拟列表和远程搜索，必须保留为 partial/unknown。
+ */
+export function optionCoverageOf(kind: FieldKind, element: HTMLElement, options: string[]): OptionCoverage {
+  return controlOptionCoverage(universalTypeFromFieldKind(kind, options.length), element, options.length)
 }
 
 export function getFieldOptions(kind: FieldKind, element: HTMLElement, radios?: HTMLInputElement[], checkboxes?: HTMLInputElement[]): string[] {

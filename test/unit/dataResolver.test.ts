@@ -79,6 +79,11 @@ describe('resolveField（槽位连接 + 闸门）', () => {
     const first = makeField({ label: '学校名称', slot: 'education.school', item: 1 })
     expect(resolveField(first, index).value).toBe('第一大学')
   })
+  it('重复槽位没有可靠段号时留空，不回退第一段', () => {
+    const index = buildFactIndex([makeFact({ group: '教育经历', key: '学校名称', value: '第一大学', item: 1 })], [])
+    const field = makeField({ label: '学校名称', slot: 'education.school', sectionId: 'education' })
+    expect(resolveField(field, index).status).toBe('empty')
+  })
   it('多个不同候选值 → needs-confirmation，不猜', () => {
     const index = buildFactIndex([
       makeFact({ group: '求职意向', key: '期望工作地点', value: '北京' }),

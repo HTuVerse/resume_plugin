@@ -1,5 +1,6 @@
 import type { SlotDef, SlotValueType } from '../../domain/slots'
 import { booleanValue, canonicalValue, sameValue } from './synonyms'
+import { semanticValuesMatch } from './valueSemantics'
 
 /**
  * 值类型校验与归一化（F04，硬闸门第 1/2 步）。
@@ -134,7 +135,7 @@ export function validateType(valueType: SlotValueType, value: string): TypeCheck
  */
 export function normalizeEnumValue(slot: SlotDef, value: string): string | null {
   if (!slot.enumValues?.length) return value.trim()
-  const hit = slot.enumValues.find(candidate => sameValue(candidate, value))
+  const hit = slot.enumValues.find(candidate => semanticValuesMatch(candidate, value, { slot }))
   if (hit) return hit
   // 尝试同义规范值（学士 → 本科）
   const canonical = canonicalValue(value)

@@ -1,11 +1,13 @@
 {
   "name": "hongtu-resume-autofill-extension",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
+    "prepare:ocr": "node scripts/prepare-ocr-assets.mjs",
+    "predev": "npm run prepare:ocr",
     "dev": "vite --host 127.0.0.1",
-    "build": "vue-tsc --noEmit && vite build && node scripts/build-content.mjs && node scripts/build-background.mjs",
+    "build": "vue-tsc --noEmit && npm run prepare:ocr && vite build && node scripts/build-content.mjs && node scripts/build-background.mjs",
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -13,8 +15,11 @@
   "dependencies": {
     "@noble/ed25519": "^3.2.0",
     "@noble/hashes": "^2.4.0",
+    "@tesseract.js-data/chi_sim": "^1.0.0",
+    "@tesseract.js-data/eng": "^1.0.0",
     "mammoth": "^1.12.3",
     "pdfjs-dist": "^6.3.289",
+    "tesseract.js": "^7.0.0",
     "vue": "^3.5.0",
     "xlsx": "^0.18.5"
   },

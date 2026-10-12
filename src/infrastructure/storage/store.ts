@@ -1,13 +1,17 @@
-import type { AiSettings, BackupPayload, CurrentResume, Fact, LearnedAlias, ResumeTemplate, SiteRule, StoredProfile } from '../../domain/types'
+import type { AiSettings, BackupPayload, CurrentResume, Fact, InteractionStrategyMemory, LearnedAlias, LearnedFieldDependency, ResumeTemplate, SiteRule, StoredProfile } from '../../domain/types'
 import { isRedacted, maskApiUrl, redactFacts } from '../privacy/privacy'
 import { foldProfileFacts } from '../../features/rag/knowledge'
 import { LEARNED_ALIASES_KEY, loadLearnedAliases, saveLearnedAliases } from '../../features/ontology/learnedAliases'
 import { SITE_RULES_KEY, loadSiteRules, saveSiteRules } from '../../features/siteRules/ruleStore'
 import { AI_SLOT_CACHE_KEY } from '../../features/ai/slotMatchCache'
 import { FILL_RECIPES_KEY, loadFillRecipes, saveFillRecipes } from '../../features/autofill/write/fillRecipes'
+import { INTERACTION_STRATEGIES_KEY, loadInteractionStrategies, saveInteractionStrategies } from '../../features/autofill/learning/strategyMemory'
+import { FIELD_DEPENDENCIES_KEY, loadFieldDependencies, saveFieldDependencies } from '../../features/autofill/learning/dependencyStore'
+import { AUTOFILL_QUALITY_KEY } from '../../features/autofill/learning/qualityMetrics'
 
 const PROFILE_KEY = 'resumeProfileV1'
 const AI_SETTINGS_KEY = 'aiSettingsV1'
+export const VISUAL_CAPABILITY_KEY = 'visualCapabilityV1'
 const TEMPLATES_KEY = 'resumeTemplatesV1'
 const CURRENT_RESUME_KEY = 'currentResumeV2'
 const RESUME_LIBRARY_KEY = 'resumeLibraryV1'
@@ -104,7 +108,7 @@ export async function saveAiSettings(settings: AiSettings): Promise<void> {
 }
 
 export async function clearAiSettings(): Promise<void> {
-  await chrome.storage.local.remove(AI_SETTINGS_KEY)
+  await chrome.storage.local.remove([AI_SETTINGS_KEY, VISUAL_CAPABILITY_KEY])
 }
 
 export async function loadTemplates(): Promise<ResumeTemplate[]> {
@@ -168,7 +172,9 @@ export async function createBackup(redactSensitive = true): Promise<BackupPayloa
     // 站点规则与学到的字段别名都不含个人数据，可不脱敏导出
     siteRules: await loadSiteRules(),
     learnedAliases: await loadLearnedAliases(),
-    fillRecipes: await loadFillRecipes()
+    fillRecipes: await loadFillRecipes(),
+    interactionStrategies: await loadInteractionStrategies(),
+    fieldDependencies: await loadFieldDependencies()
   }
 }
 
@@ -217,6 +223,12 @@ export async function restoreBackup(payload: unknown): Promise<void> {
   if (Array.isArray(checked.fillRecipes)) {
     await saveFillRecipes(checked.fillRecipes)
   }
+  if (Array.isArray(checked.interactionStrategies)) {
+    await saveInteractionStrategies(checked.interactionStrategies as InteractionStrategyMemory[])
+  }
+  if (Array.isArray(checked.fieldDependencies)) {
+    await saveFieldDependencies(checked.fieldDependencies as LearnedFieldDependency[])
+  }
   // Never restore credentials from an imported file. The exported API fields
   // are intentionally informational only and the current browser credential
   // remains untouched.
@@ -225,6 +237,7 @@ export async function restoreBackup(payload: unknown): Promise<void> {
 export async function clearAllLocalData(): Promise<void> {
   await chrome.storage.local.remove([
     PROFILE_KEY, AI_SETTINGS_KEY, TEMPLATES_KEY, CURRENT_RESUME_KEY, RESUME_LIBRARY_KEY,
-    'featureSettingsV1', SITE_RULES_KEY, SLOT_OVERRIDES_KEY, AI_SLOT_CACHE_KEY, LEARNED_ALIASES_KEY, FILL_RECIPES_KEY
+    'featureSettingsV1', VISUAL_CAPABILITY_KEY, SITE_RULES_KEY, SLOT_OVERRIDES_KEY, AI_SLOT_CACHE_KEY, LEARNED_ALIASES_KEY, FILL_RECIPES_KEY,
+    INTERACTION_STRATEGIES_KEY, FIELD_DEPENDENCIES_KEY, AUTOFILL_QUALITY_KEY
   ])
 }

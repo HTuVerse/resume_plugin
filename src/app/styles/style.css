@@ -243,6 +243,11 @@
   .current-pill, .connection-pill { @apply whitespace-nowrap rounded-full bg-[#e9fbf4] px-2 py-[5px] text-[9px] font-bold text-[#079164]; }
   .connection-pill { @apply bg-[#f0f3f8] text-brand-muted; }
   .connection-pill.ready { @apply bg-[#e9fbf4] text-[#079164]; }
+  .capability-status { @apply mb-2 flex flex-wrap gap-2; }
+  .capability-status span { @apply rounded-full bg-[#f0f3f8] px-2.5 py-1.5 text-[9px] font-bold text-brand-muted; }
+  .capability-status span.testing { @apply bg-[#fff6dc] text-[#85621c]; }
+  .capability-status span.ready { @apply bg-[#e9fbf4] text-[#079164]; }
+  .capability-status span.failed { @apply bg-[#fff2f4] text-brand-red; }
   .empty-state, .empty-card { @apply px-3 py-[30px] text-center text-brand-muted; }
   .empty-card { @apply mx-1 mb-2.5 rounded-xl border border-dashed border-[#c8d5e8] bg-white; }
   .empty-card > span { @apply text-[40px]; }

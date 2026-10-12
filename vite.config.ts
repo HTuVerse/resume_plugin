@@ -9,7 +9,8 @@ export default defineConfig({
     outDir: 'dist',
     rollupOptions: {
       input: {
-        panel: 'panel.html'
+        panel: 'panel.html',
+        offscreen: 'offscreen.html'
       }
     }
   }

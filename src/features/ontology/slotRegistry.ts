@@ -13,7 +13,7 @@ import { SECTIONS, sectionLabel } from './sections'
  * 词典升级时递增 SLOT_REGISTRY_VERSION，使 AI 匹配缓存自动失效（F43）。
  */
 
-export const SLOT_REGISTRY_VERSION = 3
+export const SLOT_REGISTRY_VERSION = 4
 
 const DEGREE_ENUM = DEGREE_LADDER.slice(1) // 初中及以上
 
@@ -497,6 +497,14 @@ export const SLOTS: SlotDef[] = [
     id: 'family.relation', section: 'family',
     aliases: ['关系', '与本人关系', '称谓', '成员关系'],
     enumValues: ['父亲', '母亲', '配偶', '兄弟', '姐妹', '子女'],
+    valueAliases: [
+      ['父亲', '爸爸', '老爸', '家父'],
+      ['母亲', '妈妈', '老妈', '家母'],
+      ['配偶', '丈夫', '妻子', '老公', '老婆'],
+      ['兄弟', '哥哥', '弟弟'],
+      ['姐妹', '姐姐', '妹妹'],
+      ['子女', '儿子', '女儿']
+    ],
     valueType: 'text', repeatable: true, sensitive: true
   },
   {

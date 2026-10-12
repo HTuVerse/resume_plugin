@@ -27,4 +27,12 @@ describe('planRepeatExpansion', () => {
   it('页面上没有该板块时不补', () => {
     expect(planRepeatExpansion([], [fact({ item: 1 }), fact({ id: 'b', item: 2 })])).toEqual([])
   })
+  it('家庭关系也会按档案条目数补段', () => {
+    const familyField = field({ label: '姓名', group: '家庭关系', sectionId: 'family', slot: 'family.name', item: undefined })
+    const familyFacts = [
+      fact({ group: '家庭关系', item: 1, key: '关系', value: '父亲' }),
+      fact({ id: 'mom', group: '家庭关系', item: 2, key: '关系', value: '母亲' })
+    ]
+    expect(planRepeatExpansion([familyField], familyFacts)).toEqual([{ section: 'family', missing: 1 }])
+  })
 })

@@ -3,11 +3,12 @@ import { sectionOfText } from '../../ontology/sections'
 import { namedSectionOf, type NamedSection } from '../namedSegment'
 
 /** 这些板块在页面上通常有「新增一段」。一次最多补 8 段，避免按钮点不动时死循环。 */
-const EXPANDABLE: NamedSection[] = ['education', 'work', 'project', 'internship', 'campus', 'award', 'certificate']
+type ExpandableSection = NamedSection | 'family'
+const EXPANDABLE: ExpandableSection[] = ['education', 'work', 'project', 'internship', 'campus', 'award', 'certificate', 'family']
 const MAX_CLICKS = 8
 
 export interface RepeatDemand {
-  section: NamedSection
+  section: ExpandableSection
   missing: number
 }
 
@@ -19,7 +20,7 @@ function profileItemCount(facts: Fact[], section: string): number {
 }
 
 function pageBlockCount(fields: FormField[], section: string): number {
-  const rows = fields.filter(field => namedSectionOf(field) === section || sectionOfText(field.group) === section)
+  const rows = fields.filter(field => field.sectionId === section || namedSectionOf(field) === section || sectionOfText(field.group) === section)
   if (!rows.length) return 0
   const items = rows.map(field => field.item).filter((item): item is number => typeof item === 'number' && item > 0)
   return items.length ? Math.max(...items) : 1

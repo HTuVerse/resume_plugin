@@ -5,6 +5,7 @@ import { buildFactIndex, fieldsNeedingAi, isPreviewFillable, resolveField, type 
 import { factToSlot } from '../../features/autofill/match/factToSlot'
 import { aliasHit, aliasSectionCount, slotById } from '../../features/ontology/slotRegistry'
 import { looksLikeFieldPrompt, plainChoiceText } from '../../features/ontology/optionMatch'
+import { compareSemanticValues, semanticValuesMatch } from '../../features/ontology/valueSemantics'
 import { dropCachedSuggestion, getCachedSuggestions, putCachedSuggestions } from '../../features/ai/slotMatchCache'
 import { learnAlias, loadLearnedAliases, recordAliasFailure, recordAliasHit } from '../../features/ontology/learnedAliases'
 import { sectionOfText } from '../../features/ontology/sections'
@@ -13,7 +14,9 @@ import { classifyPageInput, knowledgeIdentity, mergeIntoKnowledge, type LearnedE
 import { isLearnedDismissed, learnedDismissKey } from '../../features/rag/learnedDismiss'
 import { alignFamilyItem, familyItemForRelation, isFamilyField, isRelationField, relationKey } from '../../features/autofill/familyAlign'
 import { alignNamedItem, dateSlotId, fillNamedItem, nameSlotId, namedSectionOf } from '../../features/autofill/namedSegment'
-import { pageSegmentItem } from '../../features/autofill/pageSegment'
+import { pageSegmentItem, samePageSegment } from '../../features/autofill/pageSegment'
+import { bindObservedRepeatRecords, bindRepeatRecords } from '../../features/autofill/repeatBinding'
+import { splitIdentityFillRequests } from '../../features/autofill/fillPhases'
 import { recordCorrection, recordFailure, recordHit, recordObservation } from '../../features/siteRules/ruleStore'
 import { beginPanelDrag, closePanel, onContentEvent, requestContent, resizePanel } from '../bridge/panelBridge'
 import { loadAiSettings, loadCurrentResume, loadProfile, saveProfile } from '../../infrastructure/storage/store'
@@ -21,6 +24,10 @@ import { activate, loadLicense, type LicenseRecord } from '../../features/licens
 import type { AiSettings, CurrentResume, Fact, FillRequest, FillResult, FormField, LearnedAlias, PageContext, ResolvedField, SlotSuggestion } from '../../domain/types'
 import OptionsApp from './OptionsApp.vue'
 import { mergeFactsByPriority } from '../../features/autofill/factPriority'
+import { fullFieldDiagnostics, resolutionDiagnostics, summarizeFunnel } from '../../features/autofill/diagnostics/trace'
+import { buildRegressionFixture } from '../../features/autofill/diagnostics/regressionFixture'
+import { loadQualityMetrics } from '../../features/autofill/learning/qualityMetrics'
+import { planValueBindings } from '../../features/autofill/bindingPlanner'
 
 const facts = ref<Fact[]>([])
 const learnedAliasRows = ref<LearnedAlias[]>([])
@@ -40,12 +47,17 @@ const suggestion = ref('')
 const polished = ref(false)
 const pageContext = ref<PageContext | null>(null)
 const newFieldsHint = ref(0)
+const visualHealth = ref<{ checking: boolean; ready: boolean; ocrAvailable: boolean; aiAvailable: boolean; aiVerified: boolean; aiRejected: boolean; error?: string }>({
+  checking: false, ready: false, ocrAvailable: false, aiAvailable: false, aiVerified: false, aiRejected: false
+})
 /**
  * 网页学习候选：自动观察网页上的填写得出。
  * supplement = 插件没填、用户补充的；correction = 插件填了、用户改过的。
  * 确认前可在线编辑 value，确认后才写入知识库。
  */
 const learned = ref<Array<LearnedEntry & { selected: boolean; origin: 'supplement' | 'correction'; previous: string; fieldId: string; pageValue?: string }>>([])
+/** 有值但无法唯一绑定到某一条重复记录的字段数；这类字段必须阻止更新并明确提示。 */
+const unresolvedObservedCount = ref(0)
 /** 本次填写会话里放弃过的字段页面值。不写入存储，重新识别或重新读取后清空。 */
 const dismissedLearned = new Set<string>()
 const learnedListEl = ref<HTMLElement | null>(null)
@@ -53,15 +65,26 @@ const learnedListEl = ref<HTMLElement | null>(null)
 let learnedPinned = true
 let suppressLearnedScroll = false
 const revealedLearned = new Set<string>()
-const featureSettings = reactive({ autoClipboard: true, aiMapping: true, miniPanel: true, aiMatchThreshold: 85 })
+const featureSettings = reactive({ autoClipboard: true, aiMapping: true, debugMode: false, miniPanel: true, aiMatchThreshold: 85 })
 const selectedField = computed(() => fields.value.find(field => field.id === selectedPolishField.value))
 const polishableFields = computed(() => fields.value.filter(field => field.kind === 'textarea'
   || /自我评价|个人优势|自我介绍|职业目标|工作内容|项目描述|职责|description|summary/i.test(`${field.label} ${field.placeholder}`)))
 
 const aiReady = computed(() => Boolean(aiSettings.value.url && aiSettings.value.key && aiSettings.value.model))
+const visualHealthText = computed(() => {
+  if (visualHealth.value.checking) return '视觉辅助：正在检查本地 OCR…'
+  if (!visualHealth.value.ocrAvailable) return `视觉辅助：本地 OCR 不可用${visualHealth.value.error ? `（${visualHealth.value.error}）` : ''}`
+  if (!visualHealth.value.aiAvailable) return '视觉辅助：OCR 已就绪 · 视觉模型未配置'
+  if (visualHealth.value.aiVerified) return '视觉辅助：OCR 已就绪 · 图片能力已验证'
+  if (visualHealth.value.aiRejected) return '视觉辅助：OCR 已就绪 · 图片能力测试失败'
+  return '视觉辅助：OCR 已就绪 · 模型已配置（图片能力未验证）'
+})
 // 知识库（我的信息）是唯一填充数据源
 const allFacts = computed(() => mergeFactsByPriority(facts.value))
 const factIndex = computed<FactIndex>(() => buildFactIndex(facts.value))
+const repeatRecordBindings = computed(() => bindRepeatRecords(fields.value, allFacts.value, {
+  legacyWorkFallback: !fields.value.some(field => field.sectionId === 'internship' || sectionOfText(field.group) === 'internship')
+}))
 const pickerActive = ref(false)
 const expanded = ref(false)
 const showingControl = ref(false)
@@ -84,6 +107,8 @@ const report = computed(() => {
     failed: rows.filter(row => row.status === 'failed')
   }
 })
+
+const diagnosticFunnel = computed(() => summarizeFunnel(fields.value, resolutions, results))
 
 /**
  * 自动填写把本页能写的字段写完之后才为 true。
@@ -149,6 +174,11 @@ onMounted(async () => {
   if (storedFeatures.featureSettingsV1) Object.assign(featureSettings, storedFeatures.featureSettingsV1)
   const settingsChanged = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
     if (area === 'local' && changes.featureSettingsV1?.newValue) Object.assign(featureSettings, changes.featureSettingsV1.newValue)
+    if (area === 'local' && changes.aiSettingsV1) {
+      void loadAiSettings().then(settings => { aiSettings.value = settings })
+      void refreshVisualHealth()
+    }
+    if (area === 'local' && changes.visualCapabilityV1) void refreshVisualHealth()
   }
   chrome.storage.onChanged.addListener(settingsChanged)
   removeSettingsEvents = () => chrome.storage.onChanged.removeListener(settingsChanged)
@@ -160,8 +190,8 @@ onMounted(async () => {
     }
     if (event?.type === 'FIELD_OBSERVED') {
       if (!knowledgeWatch.value) return
-      const field = fields.value.find(item => item.id === event.fieldId)
-      if (field) noteObservedValue(field, String(event.value || ''))
+      // 单字段事件只用于唤醒；实际判断统一读取整页快照，避免名称/关系字段读取较晚导致串段。
+      void pollLearned()
       return
     }
     if (event?.type !== 'PICKER_RESULT') return
@@ -171,6 +201,7 @@ onMounted(async () => {
   })
   if (!license.value) return
   if (!featureSettings.miniPanel) openControl('home')
+  void refreshVisualHealth()
   await scan()
 })
 
@@ -188,6 +219,7 @@ async function submitActivation() {
     activationCode.value = ''
     if (!featureSettings.miniPanel) openControl('home')
     else resizePanel('compact')
+    void refreshVisualHealth()
     await scan()
   } catch (error) {
     activationError.value = error instanceof Error ? error.message : '激活失败'
@@ -210,6 +242,27 @@ function openControl(view: 'home' | 'resume' | 'profile' | 'assist' | 'settings'
   resizePanel('expanded')
 }
 
+async function refreshVisualHealth(): Promise<void> {
+  visualHealth.value = { ...visualHealth.value, checking: true }
+  try {
+    const response = await requestContent<{ ready?: boolean; ocrAvailable?: boolean; aiAvailable?: boolean; aiVerified?: boolean; aiRejected?: boolean; error?: string }>({ type: 'VISUAL_STATUS' })
+    visualHealth.value = {
+      checking: false,
+      ready: response.ready === true,
+      ocrAvailable: response.ocrAvailable === true,
+      aiAvailable: response.aiAvailable === true,
+      aiVerified: response.aiVerified === true,
+      aiRejected: response.aiRejected === true,
+      error: response.error
+    }
+  } catch (error) {
+    visualHealth.value = {
+      checking: false, ready: false, ocrAvailable: false, aiAvailable: false, aiVerified: false, aiRejected: false,
+      error: error instanceof Error ? error.message : '状态检查失败'
+    }
+  }
+}
+
 function openFillView() { showingControl.value = false; expanded.value = true; resizePanel('expanded') }
 function openCompactView() { showingControl.value = false; expanded.value = false; resizePanel('compact') }
 function dragFromHeader(event: PointerEvent) {
@@ -220,11 +273,9 @@ function dragFromHeader(event: PointerEvent) {
 
 function familyPeers(field: FormField): FormField[] {
   if (!isFamilyField(field)) return []
-  const pageItem = pageSegmentItem(field, fields.value)
   return fields.value.filter(other => {
     if (!isFamilyField(other)) return false
-    if (field.repeatGroupId && other.repeatGroupId) return other.repeatGroupId === field.repeatGroupId
-    return pageSegmentItem(other, fields.value) === pageItem
+    return samePageSegment(field, other, fields.value)
   })
 }
 
@@ -254,11 +305,9 @@ function familySegmentItem(field: FormField, override?: { id: string; value: str
 function namedPeers(field: FormField): FormField[] {
   const section = namedSectionOf(field)
   if (!section) return []
-  const pageItem = pageSegmentItem(field, fields.value)
   return fields.value.filter(other => {
     if (namedSectionOf(other) !== section) return false
-    if (field.repeatGroupId && other.repeatGroupId) return other.repeatGroupId === field.repeatGroupId
-    return pageSegmentItem(other, fields.value) === pageItem
+    return samePageSegment(field, other, fields.value)
   })
 }
 
@@ -303,7 +352,8 @@ function realignNamedLearned(field: FormField, item: number): void {
     if (!ids.has(row.fieldId) || row.fieldId === field.id) return [row]
     const next = { ...row, fact: { ...row.fact, item } }
     const existing = allFacts.value.find(fact => knowledgeIdentity(fact) === knowledgeIdentity(next.fact))
-    if (existing && existing.value.trim() === next.fact.value.trim()) return []
+    const slot = factToSlot(next.fact).slot
+    if (existing && semanticValuesMatch(existing.value, next.fact.value, { slot: slot ? slotById(slot) : undefined })) return []
     next.previous = existing?.value || ''
     return [next]
   })
@@ -314,12 +364,17 @@ function pageHasSection(section: string): boolean {
 }
 
 function resolveOne(field: FormField): void {
+  const repeatItems = repeatRecordBindings.value
+  const boundItem = repeatItems.has(field.id) ? repeatItems.get(field.id) : undefined
   const resolved = resolveField(field, factIndex.value, {
     aiSuggestion: aiSuggestions[field.id],
     aiMatchThreshold: featureSettings.aiMatchThreshold,
-    segmentItem: isFamilyField(field) ? familySegmentItem(field) : namedSegmentItem(field),
+    segmentItem: boundItem !== undefined
+      ? boundItem
+      : isFamilyField(field) ? familySegmentItem(field) : namedSegmentItem(field),
     legacyWorkFallback: !pageHasSection('internship')
   })
+  resolved.diagnostics = resolutionDiagnostics(field, resolved)
   resolutions[field.id] = resolved
   selections[field.id] = resolved.factId && (resolved.status === 'ready' || resolved.status === 'needs-confirmation') ? resolved.factId : ''
 }
@@ -516,85 +571,147 @@ async function selectionChanged(field: FormField) {
   }
 }
 
-async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolean }) {
-  const targets = onlyFieldId ? fields.value.filter(field => field.id === onlyFieldId) : fields.value
-  // 低置信 AI 结果虽然仍需用户核对，但已有经过值域/控件闸门校验的值，
-  // 可以先写入并用橙色高亮标记；多候选、值域不符等没有可靠写入值的结果仍留空。
-  const pendingCount = onlyFieldId ? 0 : targets.filter(field => {
+function fillRequests(targets: FormField[], onlyFieldId?: string): FillRequest[] {
+  const bindings = onlyFieldId
+    ? new Map()
+    : planValueBindings(targets, field => selections[field.id] || resolutions[field.id]?.factId)
+  for (const field of targets) {
+    const binding = bindings.get(field.id)
+    field.valueBinding = binding
+      ? { groupId: binding.groupId, shape: binding.shape, index: binding.index, size: binding.size }
+      : undefined
+  }
+  const eligible = onlyFieldId ? targets : targets.filter(field => {
+    if (isPreviewFillable(resolutions[field.id])) return true
+    const binding = bindings.get(field.id)
+    if (!binding || field.current.trim() || resolutions[field.id]?.status === 'skipped') return false
+    return !selections[field.id]
+      || (resolutions[field.id]?.status === 'needs-confirmation'
+        && resolutions[field.id]?.reasonCode === 'no-matching-option')
+  })
+  return eligible.flatMap(field => {
     const resolution = resolutions[field.id]
-    return resolution?.status === 'needs-confirmation' && !isPreviewFillable(resolution)
-  }).length
-  const emptyCount = onlyFieldId ? 0 : targets.filter(field => resolutions[field.id]?.status === 'empty').length
-  const eligible = onlyFieldId ? targets : targets.filter(field => isPreviewFillable(resolutions[field.id]))
-  const values: FillRequest[] = eligible.flatMap(field => {
-    const resolution = resolutions[field.id]
-    const fact = allFacts.value.find(item => item.id === selections[field.id])
+    const binding = bindings.get(field.id)
+    const fact = allFacts.value.find(item => item.id === (binding?.factId || selections[field.id]))
     const value = fact?.value || resolution?.value
-    if (!value || !selections[field.id]) return []
+    if (!value || (!binding && !selections[field.id])) return []
+    const factSlot = fact ? factToSlot(fact).slot : undefined
     return [{
       fieldId: field.id,
-      value: resolution?.value || value,
+      value: binding ? value : resolution?.value || value,
       source: resolution?.source === 'empty' ? fact?.source : resolution?.source,
       confidence: resolution?.confidence,
-      slot: resolution?.slot
+      slot: resolution?.slot || factSlot,
+      valueMode: binding ? 'match-options' : 'literal',
+      bindingGroupId: binding?.groupId,
+      dependsOn: binding?.previousFieldId ? [binding.previousFieldId] : undefined
     }]
   })
+}
+
+function resolutionCounts(targets: FormField[], onlyFieldId?: string): { pending: number; empty: number } {
+  if (onlyFieldId) return { pending: 0, empty: 0 }
+  return {
+    pending: targets.filter(field => {
+    const resolution = resolutions[field.id]
+    return resolution?.status === 'needs-confirmation' && !isPreviewFillable(resolution)
+    }).length,
+    empty: targets.filter(field => resolutions[field.id]?.status === 'empty').length
+  }
+}
+
+function acceptFillResults(rows: FillResult[]): void {
+  for (const result of rows) {
+    results[result.fieldId] = result
+    const field = fields.value.find(item => item.id === result.fieldId)
+    if (field?.ruleId) {
+      if (result.status === 'filled') recordHit(field.ruleId).catch(() => undefined)
+      else if (result.reasonCode === 'no-matching-option' || result.reasonCode === 'rejected-by-validation') {
+        recordFailure(field.ruleId).catch(() => undefined)
+      }
+    }
+    if (field?.learnedAlias) {
+      if (result.status === 'filled') recordAliasHit(field.learnedAlias, field.sectionId).catch(() => undefined)
+      else if (result.reasonCode === 'no-matching-option' || result.reasonCode === 'rejected-by-validation') {
+        recordAliasFailure(field.learnedAlias, field.sectionId).catch(() => undefined)
+      }
+    }
+    if (result.status !== 'filled' || !field) continue
+    const slot = resolutions[field.id]?.slot || field.slot
+    const suggestion = aiSuggestions[field.id]
+    const viaAi = resolutions[field.id]?.source === 'ai'
+      && suggestion
+      && suggestion.confidence * 100 >= featureSettings.aiMatchThreshold
+    if (viaAi && slot) rememberFieldMapping(field, slot, pageDomain(), false)
+    else {
+      const signals = field.slotCandidates?.[0]?.signals || {}
+      const inferred = signals.labelMatch !== 1 && !signals.learnedAlias && !signals.siteRule && !field.ruleId
+      const domain = pageDomain()
+      if (inferred && slot && domain) recordObservation(domain, field.fingerprint, slot, 'fill').catch(() => undefined)
+    }
+  }
+}
+
+async function sendFillRequests(values: FillRequest[], resetUndo: boolean): Promise<FillResult[]> {
+  if (!values.length) return []
+  const response = await requestContent({ type: 'FILL', values, resetUndo })
+  if (response.error) throw new Error(response.error)
+  const rows = response.results as FillResult[]
+  acceptFillResults(rows)
+  return rows
+}
+
+async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolean }) {
+  let targets = onlyFieldId ? fields.value.filter(field => field.id === onlyFieldId) : fields.value
+  let counts = resolutionCounts(targets, onlyFieldId)
+  let values = fillRequests(targets, onlyFieldId)
   if (!values.length) {
     if (options?.armKnowledgeWatch) {
       knowledgeWatch.value = true
       learned.value = []
     }
     const watchNote = options?.armKnowledgeWatch ? '正在监测你之后在网页上的修改。' : ''
-    status.value = pendingCount
-      ? `${pendingCount} 个字段仍待确认（候选冲突或选项需核对），请先在下拉中逐项确认。${watchNote}`
+    status.value = counts.pending
+      ? `${counts.pending} 个字段仍待确认（候选冲突或选项需核对），请先在下拉中逐项确认。${watchNote}`
       : `请先为至少一个字段选择档案信息。${watchNote}`
     return
   }
   busy.value = true
   try {
-    const response = await requestContent({ type: 'FILL', values })
-    if (response.error) throw new Error(response.error)
-    for (const result of response.results as FillResult[]) {
-      results[result.fieldId] = result
-      // 站点规则命中统计（F25/§12.2）：命中规则的字段成功计 hit、失败计 fail
-      const field = fields.value.find(item => item.id === result.fieldId)
-      if (field?.ruleId) {
-        if (result.status === 'filled') recordHit(field.ruleId).catch(() => undefined)
-        else if (result.reasonCode === 'no-matching-option' || result.reasonCode === 'rejected-by-validation') {
-          recordFailure(field.ruleId).catch(() => undefined)
-        }
+    let rows: FillResult[] = []
+    const phases = splitIdentityFillRequests(values, fields.value)
+    if (!onlyFieldId && phases.identity.length && phases.remaining.length) {
+      status.value = `正在先填写 ${phases.identity.length} 个记录身份字段…`
+      const identityRows = await sendFillRequests(phases.identity, true)
+      rows.push(...identityRows)
+
+      status.value = '身份字段已填写，正在等待页面更新并重新识别…'
+      const again = await requestContent({ type: 'SCAN', probeOptions: true })
+      if (again.error) throw new Error(again.error)
+      applyScan(again)
+      for (const result of identityRows) {
+        if (fields.value.some(field => field.id === result.fieldId)) results[result.fieldId] = result
       }
-      if (field?.learnedAlias) {
-        if (result.status === 'filled') recordAliasHit(field.learnedAlias, field.sectionId).catch(() => undefined)
-        else if (result.reasonCode === 'no-matching-option' || result.reasonCode === 'rejected-by-validation') {
-          recordAliasFailure(field.learnedAlias, field.sectionId).catch(() => undefined)
-        }
-      }
-      if (result.status === 'filled' && field) {
-        const slot = resolutions[field.id]?.slot || field.slot
-        const suggestion = aiSuggestions[field.id]
-        const viaAi = resolutions[field.id]?.source === 'ai'
-          && suggestion
-          && suggestion.confidence * 100 >= featureSettings.aiMatchThreshold
-        if (viaAi && slot) rememberFieldMapping(field, slot, pageDomain(), false)
-        else {
-          const signals = field.slotCandidates?.[0]?.signals || {}
-          const inferred = signals.labelMatch !== 1 && !signals.learnedAlias && !signals.siteRule && !field.ruleId
-          const domain = pageDomain()
-          if (inferred && slot && domain) recordObservation(domain, field.fingerprint, slot, 'fill').catch(() => undefined)
-        }
-      }
+      if (featureSettings.aiMapping && aiReady.value) await aiMatch()
+      busy.value = true
+      targets = fields.value
+      counts = resolutionCounts(targets)
+      values = fillRequests(targets)
+      status.value = `页面已更新，正在填写其余 ${values.length} 个字段…`
+      rows.push(...await sendFillRequests(values, false))
+    } else {
+      rows = await sendFillRequests(values, true)
     }
-    const rows = response.results as FillResult[]
-    const filled = rows.filter(result => result.status === 'filled').length
-    const kept = rows.filter(result => result.status === 'skipped').length
-    const failed = rows.filter(result => result.status === 'failed').length
+    const summaryRows = [...new Map(rows.map(result => [result.fieldId, result])).values()]
+    const filled = summaryRows.filter(result => result.status === 'filled').length
+    const kept = summaryRows.filter(result => result.status === 'skipped').length
+    const failed = summaryRows.filter(result => result.status === 'failed').length
     if (options?.armKnowledgeWatch) {
       knowledgeWatch.value = true
       learned.value = []
     }
     const watchNote = options?.armKnowledgeWatch ? '填写已完成，正在监测你之后在网页上的修改。' : ''
-    status.value = `已填写 ${filled} 项，原值保留 ${kept} 项，失败 ${failed} 项${pendingCount ? `；${pendingCount} 个字段仍待确认（候选冲突或选项需核对）` : ''}${emptyCount ? `；${emptyCount} 个字段知识库无数据` : ''}。${watchNote}低置信匹配已用橙色标记，请在「核对匹配」中确认后再提交。`
+    status.value = `已填写 ${filled} 项，原值保留 ${kept} 项，失败 ${failed} 项${counts.pending ? `；${counts.pending} 个字段仍待确认（候选冲突或选项需核对）` : ''}${counts.empty ? `；${counts.empty} 个字段知识库无数据` : ''}。${watchNote}低置信匹配已用橙色标记，请在「核对匹配」中确认后再提交。`
   } catch (error) { status.value = error instanceof Error ? error.message : '填写失败。' }
   finally { busy.value = false }
 }
@@ -636,7 +753,13 @@ function learnedValue(field: FormField, raw: string): string {
   return taken ? '' : now
 }
 
-function noteObservedValue(field: FormField, raw: string, quiet = false): void {
+function noteObservedValue(
+  field: FormField,
+  raw: string,
+  quiet = false,
+  observedBindings?: Map<string, number | null>,
+  previousCurrent = field.current
+): void {
   const now = learnedValue(field, raw)
   const learnedAt = () => learned.value.findIndex(row => row.fieldId === field.id)
   const drop = () => {
@@ -664,11 +787,15 @@ function noteObservedValue(field: FormField, raw: string, quiet = false): void {
     }
   }
   const written = results[field.id]?.status === 'filled' ? (results[field.id].value || '').trim() : ''
-  const changedOnPage = field.current.trim() !== now
-  if (written && now === written) {
+  const changedOnPage = previousCurrent.trim() !== now
+  const comparisonSlot = field.slot || resolutions[field.id]?.slot
+  const semanticContext = { slot: comparisonSlot ? slotById(comparisonSlot) : undefined, field }
+  if (written && semanticValuesMatch(written, now, semanticContext)) {
     drop()
-    const named = namedAlignInput(field, { id: field.id, value: now })
-    if (named) realignNamedLearned(field, alignNamedItem(named))
+    if (!observedBindings) {
+      const named = namedAlignInput(field, { id: field.id, value: now })
+      if (named) realignNamedLearned(field, alignNamedItem(named))
+    }
     if (!quiet && changedOnPage) status.value = `「${field.label || '该字段'}」仍是已填写的内容，无需更新。`
     return
   }
@@ -676,17 +803,31 @@ function noteObservedValue(field: FormField, raw: string, quiet = false): void {
   const sourceField = slot && slot !== field.slot ? { ...field, slot } : field
   const entry = classifyPageInput(sourceField, now, learnedAliasRows.value)
   if (!entry) return
-  if (isFamilyField(sourceField)) {
+  if (observedBindings?.has(field.id)) {
+    const bound = observedBindings.get(field.id)
+    if (bound === null || bound === undefined) {
+      drop()
+      field.current = now
+      return
+    }
+    entry.fact.item = bound
+  } else if (isFamilyField(sourceField)) {
     const relation = segmentRelation(sourceField, { id: field.id, value: now }) || (isRelationField(sourceField) ? relationKey(now) : '')
     entry.fact.item = alignFamilyItem(entry.fact.item, relation, allFacts.value)
   }
-  const named = namedAlignInput(sourceField, { id: field.id, value: now })
-  if (named) {
-    entry.fact.item = alignNamedItem(named)
-    realignNamedLearned(sourceField, entry.fact.item)
+  if (!observedBindings) {
+    const named = namedAlignInput(sourceField, { id: field.id, value: now })
+    if (named) {
+      entry.fact.item = alignNamedItem(named)
+      realignNamedLearned(sourceField, entry.fact.item)
+    }
   }
   const existing = allFacts.value.find(fact => knowledgeIdentity(fact) === knowledgeIdentity(entry.fact))
-  if (existing && existing.value.trim() === now) {
+  const relation = existing ? compareSemanticValues(existing.value, now, {
+    slot: entry.slot ? slotById(entry.slot) : undefined,
+    field: sourceField
+  }) : 'different'
+  if (existing && (relation === 'equal' || relation === 'compatible')) {
     drop()
     if (!quiet && changedOnPage) status.value = `「${entry.fact.key}」与知识库一致，无需更新。`
     return
@@ -717,6 +858,56 @@ function noteObservedValue(field: FormField, raw: string, quiet = false): void {
   if (!quiet) status.value = `已记录「${entry.fact.key}」→ ${now.slice(0, 24)}。请确认后再更新知识库。`
 }
 
+/**
+ * 监测必须以同一时刻的整页值为输入：先更新所有段锚点，再一次性绑定记录，最后逐字段比较。
+ */
+function processObservedSnapshot(valueMap: Map<string, string>, quiet: boolean): void {
+  const previous = new Map(fields.value.map(field => [field.id, field.current]))
+  for (const field of fields.value) {
+    const now = learnedValue(field, valueMap.get(field.id) || '')
+    if (now || field.kind !== 'radio') field.current = now
+  }
+  const effectiveFields = fields.value.map(field => {
+    const slot = field.slot || resolutions[field.id]?.slot
+    return slot && slot !== field.slot ? { ...field, slot } : field
+  })
+  const bindings = bindObservedRepeatRecords(effectiveFields, allFacts.value)
+  unresolvedObservedCount.value = effectiveFields.filter(field => bindings.has(field.id)
+    && bindings.get(field.id) === null
+    && Boolean(learnedValue(field, valueMap.get(field.id) || ''))).length
+  const handled = new Set<string>()
+  const valueGroups = new Map<string, FormField[]>()
+  for (const field of fields.value) {
+    const binding = field.valueBinding
+    if (!binding || binding.shape !== 'sequence') continue
+    const rows = valueGroups.get(binding.groupId) || []
+    rows.push(field)
+    valueGroups.set(binding.groupId, rows)
+  }
+  for (const rows of valueGroups.values()) {
+    rows.sort((left, right) => (left.valueBinding?.index || 0) - (right.valueBinding?.index || 0))
+    rows.forEach(field => handled.add(field.id))
+    const currentParts = rows.map(field => learnedValue(field, valueMap.get(field.id) || ''))
+    // 任一成员尚未回读到值时，整组都视为 partial，禁止把局部页面值写回知识库。
+    if (currentParts.some(part => !part)) continue
+    const previousParts = rows.map(field => previous.get(field.id) || '').filter(Boolean)
+    const representative = rows.find(field => field.slot || resolutions[field.id]?.slot) || rows[0]
+    const memberIds = new Set(rows.filter(field => field.id !== representative.id).map(field => field.id))
+    learned.value = learned.value.filter(row => !memberIds.has(row.fieldId))
+    noteObservedValue(
+      representative,
+      currentParts.join(' / '),
+      quiet,
+      bindings,
+      previousParts.join(' / ')
+    )
+  }
+  for (const field of fields.value) {
+    if (handled.has(field.id)) continue
+    noteObservedValue(field, valueMap.get(field.id) || '', quiet, bindings, previous.get(field.id) || '')
+  }
+}
+
 let learnedWatchTimer = 0
 let learnedWatchBusy = false
 let learnedWatchSeen = false
@@ -732,16 +923,19 @@ async function pollLearned(): Promise<void> {
   if (!knowledgeWatch.value || learnedWatchBusy || document.hidden) return
   learnedWatchBusy = true
   const known = new Set(learned.value.map(row => row.fieldId))
+  const previousUnresolved = unresolvedObservedCount.value
   try {
     const response = await requestContent({ type: 'READ_VALUES' })
     if (response.error || !knowledgeWatch.value) return
     const valueMap = new Map<string, string>((response.values || []).map((row: { fieldId: string; value: string }) => [row.fieldId, row.value]))
-    for (const field of fields.value) noteObservedValue(field, valueMap.get(field.id) || '', true)
+    processObservedSnapshot(valueMap, true)
     const added = learned.value.filter(row => !known.has(row.fieldId))
     if (learnedWatchSeen && added.length) {
       status.value = added.length === 1
         ? `已记录「${added[0].fact.key}」→ ${added[0].fact.value.slice(0, 24)}。请确认后再更新知识库。`
         : `监测到 ${added.length} 项修改，已列在下方。请确认后再更新知识库。`
+    } else if (learnedWatchSeen && unresolvedObservedCount.value > 0 && unresolvedObservedCount.value !== previousUnresolved) {
+      status.value = `${unresolvedObservedCount.value} 个字段无法唯一确定所属段，已停止自动更新这些字段，请先补充该段的名称或其他身份信息。`
     }
     learnedWatchSeen = true
   } catch { /* 下一轮再读 */ }
@@ -767,12 +961,15 @@ async function collectLearned() {
     if (response.error) throw new Error(response.error)
     dismissedLearned.clear()
     const valueMap = new Map<string, string>((response.values || []).map((row: { fieldId: string; value: string }) => [row.fieldId, row.value]))
-    for (const field of fields.value) noteObservedValue(field, valueMap.get(field.id) || '', true)
+    processObservedSnapshot(valueMap, true)
     if (learned.value.length) revealLatestLearned()
     const corrections = learned.value.filter(entry => entry.origin === 'correction').length
+    const unresolved = unresolvedObservedCount.value
     status.value = learned.value.length
-      ? `发现 ${learned.value.length - corrections} 条补充、${corrections} 条修正。请在下方核对并编辑，确认无误后再更新知识库。`
-      : '没有发现需要学习的内容：页面值与插件填写和知识库一致。'
+      ? `发现 ${learned.value.length - corrections} 条补充、${corrections} 条修正${unresolved ? `；另有 ${unresolved} 个字段无法唯一确定所属段，已阻止更新` : ''}。请在下方核对并编辑，确认无误后再更新知识库。`
+      : unresolved
+        ? `${unresolved} 个字段无法唯一确定所属段，已停止自动更新这些字段，请先补充该段的名称或其他身份信息。`
+        : '没有发现需要学习的内容：页面值与插件填写和知识库一致。'
   } catch (error) { status.value = error instanceof Error ? error.message : '读取页面输入失败。' }
   finally { busy.value = false }
 }
@@ -961,7 +1158,71 @@ function resultDetail(result: FillResult): string {
   const parts = [result.message]
   if (result.reasonCode && result.reasonCode !== 'ok') parts.push(`原因码：${result.reasonCode}`)
   if (result.attempts && result.attempts > 1) parts.push(`重试 ${result.attempts - 1} 次`)
+  if (result.trace?.length) {
+    const stageNames: Record<string, string> = { locate: '定位', precheck: '预检', apply: '写入', settle: '等待', verify: '验证', visual: '视觉' }
+    parts.push(`轨迹：${result.trace.slice(-8).map(step => `${stageNames[step.stage] || step.stage}${step.status === 'ok' ? '✓' : step.status === 'retry' ? '↻' : step.status === 'skipped' ? '－' : '×'}`).join('→')}`)
+  }
   return parts.join(' · ')
+}
+
+function diagnosticDetail(field: FormField): string {
+  const stageNames: Record<string, string> = {
+    discovery: '发现', classification: '分类', 'semantic-match': '语义',
+    'fact-join': '数据', 'value-gate': '闸门', interaction: '交互', verification: '验证', visual: '视觉'
+  }
+  const reasonNames: Record<string, string> = {
+    'unlabeled-control': '缺少标签', 'unknown-control-type': '类型未知', 'unknown-slot': '语义未知',
+    'ambiguous-slot': '语义歧义', 'no-profile-data': '知识库无数据', 'multiple-profile-candidates': '多个档案候选',
+    'blocked-by-complete-option-set': '完整选项无匹配', 'partial-option-set-search-required': '需展开搜索',
+    'multiple-option-candidates': '选项歧义', 'value-validation-rejected': '值校验拒绝', 'value-truncated': '内容已截断',
+    'popup-not-found': '浮层未找到', 'remote-options-timeout': '远程选项超时', 'trusted-input-failed': '可信输入失败',
+    'readback-mismatch': '回读不一致', 'validation-rejected': '页面校验拒绝', 'visual-not-eligible': '不适用视觉',
+    'visual-not-configured': '视觉未配置', 'visual-consensus-failed': '视觉未达成一致', 'restricted-frame': '受限页面区域'
+  }
+  const statusMarks: Record<string, string> = { passed: '✓', warning: '△', blocked: '×', skipped: '－' }
+  return fullFieldDiagnostics(field, resolutions[field.id], results[field.id])
+    .map(item => {
+      const detail = item.reason ? reasonNames[item.reason] || item.reason : item.strategy?.startsWith('trusted:') ? '可信输入' : ''
+      return `${stageNames[item.stage] || item.stage}${statusMarks[item.status] || ''}${detail ? `(${detail})` : ''}`
+    })
+    .join('→')
+}
+
+async function exportDiagnostics(): Promise<void> {
+  const quality = await loadQualityMetrics().catch(() => [])
+  const payload = {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    summary: diagnosticFunnel.value,
+    quality,
+    regressionFixture: buildRegressionFixture(pageDomain(), fields.value, resolutions, results),
+    fields: fields.value.map((field, index) => ({
+      index: index + 1,
+      kind: field.kind,
+      frame: field.frameId ?? 0,
+      required: field.required,
+      optionCoverage: field.optionCoverage,
+      slotStatus: field.slotStatus,
+      resolutionStatus: resolutions[field.id]?.status,
+      resultStatus: results[field.id]?.status,
+      reasonCode: results[field.id]?.reasonCode || resolutions[field.id]?.reasonCode,
+      attempts: results[field.id]?.attempts,
+      elapsedMs: results[field.id]?.elapsedMs,
+      diagnostics: fullFieldDiagnostics(field, resolutions[field.id], results[field.id]).map(item => ({
+        stage: item.stage,
+        status: item.status,
+        reason: item.reason,
+        strategy: item.strategy,
+        optionCoverage: item.optionCoverage
+      }))
+    }))
+  }
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `resume-autofill-diagnostics-${new Date().toISOString().slice(0, 10)}.json`
+  anchor.click()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 </script>
 
@@ -1050,6 +1311,7 @@ function resultDetail(result: FillResult): string {
           </template>
         </section>
         <p :class="['panel-status', { loading: autoFillRunning }]" role="status"><span v-if="autoFillRunning" class="inline-loading"></span>{{ status }}</p>
+        <p class="visual-health-line"><span :class="{ ready: visualHealth.ocrAvailable }">●</span>{{ visualHealthText }} <button :disabled="visualHealth.checking" @click="refreshVisualHealth">刷新</button></p>
       </div>
       <footer class="panel-footer shrink-0"><button @click="openControl('settings')"><span>⚙</span>设置</button><button @click="openControl('home')"><span>⛶</span>展开</button><button @click="closePanel"><span>×</span>关闭</button></footer>
     </template>
@@ -1057,6 +1319,11 @@ function resultDetail(result: FillResult): string {
     <div v-else class="panel-body">
       <div class="panel-toolbar"><button @click="openCompactView">‹ 返回缩小态</button><span>核对匹配</span><button @click="scan()">↻ 重新识别</button></div>
       <div class="panel-metrics"><div><b>{{ fields.length }}</b><small>识别字段</small></div><div><b>{{ matchedCount }}</b><small>成功匹配</small></div><div><b>{{ report.filled.length }}</b><small>已填写</small></div><div><b>{{ report.failed.length }}</b><small>失败</small></div></div>
+      <div class="diagnostic-funnel" aria-label="字段处理漏斗">
+        <span>发现 {{ diagnosticFunnel.discovered }}</span><i>→</i><span>分类 {{ diagnosticFunnel.classified }}</span><i>→</i><span>语义 {{ diagnosticFunnel.semanticMatched }}</span><i>→</i><span>闸门 {{ diagnosticFunnel.gatePassed }}</span><i>→</i><span>交互 {{ diagnosticFunnel.interactionStarted }}</span><i>→</i><span>验证 {{ diagnosticFunnel.verified }}</span>
+        <button :disabled="!fields.length" title="包含脱敏字段轨迹、质量指标和回归夹具" @click="exportDiagnostics">导出诊断/质量</button>
+      </div>
+      <p class="visual-health-line"><span :class="{ ready: visualHealth.ocrAvailable }">●</span>{{ visualHealthText }} <button :disabled="visualHealth.checking" @click="refreshVisualHealth">刷新</button></p>
       <p v-if="newFieldsHint" class="picker-notice">页面出现 {{ newFieldsHint }} 个新字段。<button @click="scan()">重新识别</button></p>
       <p v-if="pickerActive" class="picker-notice">请点击网页中的目标输入框。<button @click="cancelPicker">取消</button></p>
       <p class="panel-status" role="status">{{ status }}</p>
@@ -1083,6 +1350,7 @@ function resultDetail(result: FillResult): string {
               <option v-for="fact in allFacts" :key="fact.id" :value="fact.id">{{ factLabel(fact) }}</option>
             </select>
             <small v-if="matchSummary(field.id)" :class="resolutions[field.id]?.status === 'needs-confirmation' ? 'warning-text' : 'success-text'">{{ matchSummary(field.id) }}</small>
+            <small class="diagnostic-line">漏斗：{{ diagnosticDetail(field) }}</small>
             <button class="assist-one" :disabled="busy || !selections[field.id]" @click="manualFill(field)">填入此字段</button>
             <small v-if="results[field.id]" :class="resultTone(results[field.id])">{{ resultDetail(results[field.id]) }}</small>
             <button v-if="results[field.id]?.status === 'failed'" class="assist-one" :disabled="busy" @click="fill(field.id)">重试该字段</button>
@@ -1110,6 +1378,50 @@ function resultDetail(result: FillResult): string {
 </template>
 
 <style scoped>
+.visual-health-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 6px 0;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.visual-health-line > span { color: #f59e0b; font-size: 8px; }
+.visual-health-line > span.ready { color: #22c55e; }
+.visual-health-line button {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 10px;
+}
+.visual-health-line button:disabled { color: #94a3b8; cursor: default; }
+.diagnostic-funnel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 7px 0;
+  padding: 7px 9px;
+  border: 1px solid #dbeafe;
+  border-radius: 9px;
+  background: #f8fbff;
+  color: #475569;
+  font-size: 10px;
+}
+.diagnostic-funnel i { color: #94a3b8; font-style: normal; }
+.diagnostic-funnel button {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 10px;
+}
+.diagnostic-funnel button:disabled { color: #94a3b8; cursor: default; }
+.diagnostic-line { color: #64748b; line-height: 1.45; overflow-wrap: anywhere; }
 .activation-shell {
   width: 116.28%;
   height: 116.28%;

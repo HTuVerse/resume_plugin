@@ -36,6 +36,11 @@ export interface SlotDef {
    * 其他类型（如民族）仅用于选项集合反推信号（enumSignature）。
    */
   enumValues?: string[]
+  /**
+   * 该槽位内部的值别名。每组第一个值是规范值；比较、回读和知识库合并共用。
+   * 与全局同义词不同，这些别名只在当前槽位生效，避免相同词语在别的语义中误合并。
+   */
+  valueAliases?: string[][]
   /** 该槽位是否随区块重复（教育经历可重复，最高学历不可）。 */
   repeatable: boolean
   /** 默认不自动填写，需用户在设置中逐项开启（F54）。 */

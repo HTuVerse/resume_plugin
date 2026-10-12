@@ -13,11 +13,37 @@ function sectionOf(field: FormField): string {
 }
 
 function sameSemanticField(left: FormField, right: FormField): boolean {
+  if ((left.frameId || 0) !== (right.frameId || 0)) return false
   if (sectionOf(left) !== sectionOf(right)) return false
   if (left.slot && right.slot) return left.slot === right.slot
   const leftLabel = normalize(left.label)
   const rightLabel = normalize(right.label)
   return Boolean(leftLabel && rightLabel && leftLabel === rightLabel)
+}
+
+function indexedItem(field: FormField, fields: FormField[]): number | undefined {
+  const indexed = (value: string | undefined): number | undefined => {
+    if (!value) return undefined
+    const bracket = [...value.matchAll(/\[(\d+)\]/g)].at(-1)
+    if (bracket) return Number(bracket[1])
+    const separated = [...value.matchAll(/(?:^|[._-])(\d+)(?=[._-]|$)/g)].at(-1)
+    return separated ? Number(separated[1]) : undefined
+  }
+  const raw = indexed(field.attrs?.name || field.name) ?? indexed(field.attrs?.id)
+  if (raw === undefined) return undefined
+
+  const section = sectionOf(field)
+  const frameId = field.frameId || 0
+  const hints = fields
+    .filter(candidate => sectionOf(candidate) === section && (candidate.frameId || 0) === frameId)
+    .map(candidate => indexed(candidate.attrs?.name || candidate.name) ?? indexed(candidate.attrs?.id))
+    .filter((item): item is number => item !== undefined)
+  const occurrences = hints.filter(item => item === raw).length
+  const distinct = [...new Set(hints)].sort((a, b) => a - b)
+  // 数字必须至少被同一行的两个控件共享，或页面上明确出现多个数组下标。
+  // 避免把普通控件 ID 末尾的流水号误当成重复段号。
+  if (occurrences < 2 && distinct.length < 2) return undefined
+  return distinct.indexOf(raw) + 1
 }
 
 /**
@@ -33,6 +59,9 @@ export function pageSegmentItem(field: FormField, fields: FormField[]): number {
   const explicit = Math.max(0, Number(field.item) || 0)
   if (!REPEAT_SECTIONS.has(section)) return explicit || 1
 
+  const fromArrayPath = indexedItem(field, fields)
+  if (!explicit && fromArrayPath) return fromArrayPath
+
   const peers = fields.filter(candidate => sameSemanticField(field, candidate))
   const occurrence = Math.max(1, peers.findIndex(candidate => candidate.id === field.id) + 1)
   if (!explicit) return occurrence
@@ -40,4 +69,15 @@ export function pageSegmentItem(field: FormField, fields: FormField[]): number {
   // 同一个语义字段出现相同显式段号，说明重复段识别发生了碰撞，改用出现顺序。
   const collision = peers.filter(candidate => Math.max(0, Number(candidate.item) || 0) === explicit).length > 1
   return collision ? occurrence : explicit
+}
+
+/** 同一个重复集合中的一个具体段实例。重复组 ID 本身不代表具体段。 */
+export function pageSegmentKey(field: FormField, fields: FormField[]): string {
+  const section = sectionOf(field)
+  const scope = field.repeatGroupId || 'ungrouped'
+  return `${field.frameId || 0}:${section}:${scope}:${pageSegmentItem(field, fields)}`
+}
+
+export function samePageSegment(left: FormField, right: FormField, fields: FormField[]): boolean {
+  return pageSegmentKey(left, fields) === pageSegmentKey(right, fields)
 }

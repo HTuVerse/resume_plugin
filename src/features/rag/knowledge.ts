@@ -5,6 +5,7 @@ import { SLOTS, aliasHit, aliasSectionCount, slotByAliasInSection, slotById } fr
 import { sectionLabel, sectionOfText } from '../ontology/sections'
 import { isFieldIdentifier } from '../autofill/scan/labelResolver'
 import { normalize } from '../../shared/normalize'
+import { compareSemanticValues, semanticValuesMatch } from '../ontology/valueSemantics'
 
 /**
  * 本地知识库（RAG）统一入口。
@@ -45,12 +46,13 @@ export function canonicalizeFact(fact: Fact): Fact {
 
 /** 批量归一并按 (板块, 条目, 字段, 值) 去重（不同值保留，供用户核对）。 */
 export function canonicalizeFacts(facts: Fact[]): Fact[] {
-  const seen = new Set<string>()
   const out: Fact[] = []
   for (const fact of facts.map(canonicalizeFact)) {
-    const identity = `${normalize(fact.group)}|${Math.max(1, fact.item || 1)}|${normalize(fact.key)}|${normalize(fact.value)}`
-    if (seen.has(identity)) continue
-    seen.add(identity)
+    const identity = knowledgeIdentity(fact)
+    const mapped = factToSlot(fact)
+    const duplicate = out.some(existing => knowledgeIdentity(existing) === identity
+      && semanticValuesMatch(existing.value, fact.value, { slot: mapped.slot ? slotById(mapped.slot) : undefined }))
+    if (duplicate) continue
     out.push(fact)
   }
   return out
@@ -190,12 +192,16 @@ export function mergeIntoKnowledge(existing: Fact[], incoming: Fact[]): Knowledg
   for (const fact of incoming) {
     const identity = identityOf(fact)
     const current = byIdentity.get(identity)
+    const mapped = factToSlot(fact)
+    const slot = mapped.slot ? slotById(mapped.slot) : undefined
+    const relation = current ? compareSemanticValues(current.value, fact.value, { slot }) : 'different'
+    // 相同含义或页面低精度投影不应制造“更新”，更不能用低精度值覆盖完整资料。
+    if (current && (relation === 'equal' || relation === 'compatible')) continue
     if (current) updated += 1
     else {
       added += 1
       order.push(identity)
     }
-    const mapped = factToSlot(fact)
     const canonicalKey = mapped.slot ? slotById(mapped.slot)?.aliases[0] : undefined
     byIdentity.set(identity, {
       ...fact,
@@ -228,7 +234,10 @@ export function foldProfileFacts(facts: Fact[]): Fact[] {
     }
     const currentStamp = Date.parse(current.updatedAt || '') || 0
     const nextStamp = Date.parse(folded.updatedAt || '') || 0
-    const nextWins = (Boolean(folded.value.trim()) && !current.value.trim()) || (nextStamp >= currentStamp && Boolean(folded.value.trim()))
+    const mapped = factToSlot(folded)
+    const relation = compareSemanticValues(current.value, folded.value, { slot: mapped.slot ? slotById(mapped.slot) : undefined })
+    const nextWins = relation === 'enrichment'
+      || (relation === 'different' && ((Boolean(folded.value.trim()) && !current.value.trim()) || (nextStamp >= currentStamp && Boolean(folded.value.trim()))))
     if (!nextWins) continue
     byIdentity.set(identity, { ...folded, id: current.id, group: current.group })
   }

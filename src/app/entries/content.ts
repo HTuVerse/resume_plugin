@@ -2,16 +2,30 @@ import type { FillRequest, FillResult, FormField } from '../../domain/types'
 import { choiceGroupOf, choiceObserveRoots, eventElement, looksLikeChoice, readClickedChoice, readCurrentValue, scanPage, type FieldRef } from '../../features/autofill/scan/collector'
 import { visibleChoiceText } from '../../features/autofill/scan/labelResolver'
 import { clickAddForSection, clickAddNear } from '../../features/autofill/scan/repeatGroups'
-import { isElementVisible, pollUntil } from '../../features/autofill/write/domUtils'
+import { isElementVisible, pollUntil, wait } from '../../features/autofill/write/domUtils'
 import { normalize } from '../../shared/normalize'
 import { isPlaceholderOption } from '../../features/ontology/optionMatch'
 import { scoreFieldSlots, decideSlot } from '../../features/autofill/match/fieldToSlot'
+import { inferQualifiedField } from '../../features/ontology/recordIdentity'
 import { executeFillSequence, undoRecord, type UndoRecord } from '../../features/autofill/write/writeMachine'
+import { createVisualRecovery, warmupVisualAssist } from '../../features/autofill/write/visualFallback'
 import { loadFillRecipes, priorValuesFor, recipeFor, rememberSuccessfulFill } from '../../features/autofill/write/fillRecipes'
 import { loadLearnedAliases } from '../../features/ontology/learnedAliases'
 import { probeEmptyChoiceOptions } from '../../features/autofill/scan/probeOptions'
+import { scanDiagnostics } from '../../features/autofill/diagnostics/trace'
 import { findSiteRule, loadSiteRules, rulesForDomain } from '../../features/siteRules/ruleStore'
 import { LICENSE_REQUIRED_MESSAGE, loadLicense } from '../../features/license/license'
+import { loadInteractionStrategies, preferredStrategyFor, recordInteractionStrategy, successfulStrategy } from '../../features/autofill/learning/strategyMemory'
+import { applyLearnedDependencies, captureOptionStates, changedOptionFields, loadFieldDependencies, recordDependencyOutcome, recordFieldDependencies } from '../../features/autofill/learning/dependencyStore'
+import { recordQualityResult } from '../../features/autofill/learning/qualityMetrics'
+import {
+  PLATFORM_CHOICE_WRAPPER_SELECTOR,
+  PLATFORM_DATE_SELECTOR,
+  PLATFORM_OPTION_SELECTOR,
+  PLATFORM_POPUP_SELECTOR,
+  PLATFORM_RADIO_GROUP_SELECTOR,
+  PLATFORM_SELECT_SELECTOR
+} from '../../features/autofill/platforms/registry'
 
 /**
  * 内容脚本编排层（TECH_DESIGN §10）。
@@ -23,8 +37,7 @@ import { LICENSE_REQUIRED_MESSAGE, loadLicense } from '../../features/license/li
 
 declare global { interface Window { __resumeFormAssistantRuntime?: string } }
 
-const CONTENT_RUNTIME = 'hongtu-resume-autofill-2.0.0'
-const TOGGLE_EVENT = `resume-autofill-toggle-${CONTENT_RUNTIME}`
+const CONTENT_RUNTIME = 'hongtu-resume-autofill-2.1.0'
 const IS_COORDINATOR = window.top === window
 
 if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
@@ -33,6 +46,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   // ─── 各 frame 共用：扫描 / 填写 / 撤销 ─────────────────────
 
   let refs = new Map<string, FieldRef>()
+  let scannedFields: FormField[] = []
   let undoStack: UndoRecord[] = []
   let lastFingerprints = new Set<string>()
   let hasScanned = false
@@ -47,11 +61,11 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   let activeLearn: { fingerprint: string; ref: FieldRef } | null = null
 
   const CHOICE_KINDS = new Set(['radio', 'checkbox', 'select', 'multiselect', 'combobox', 'cascade', 'date'])
-  const POPUP_SELECTOR = '.ant-select-dropdown,.el-select-dropdown,.el-select__popper,.el-picker__popper,.arco-select-dropdown,.arco-trigger-popup,.n-base-select-menu,.ivu-select-dropdown,.semi-select-dropdown,.t-select__dropdown,.t-popup,.ant-picker-dropdown,.ant-picker-panel,.el-picker-panel,.el-time-panel,.arco-picker-panel,[role="listbox"]'
-  const WATCH_WIDGET = '.ant-select,.el-select,.arco-select,.n-select,.ivu-select,.ant-radio-group,.el-radio-group,.arco-radio-group,.n-radio-group,.ivu-radio-group,.van-radio-group,.t-radio-group,.semi-radio-group,[role="radiogroup"],.ant-picker,.el-date-editor,.arco-picker,.el-time-select,[class*="date-picker"],[class*="time-picker"]'
+  const POPUP_SELECTOR = ['.ant-select-dropdown,.el-select-dropdown,.el-select__popper,.el-picker__popper,.arco-select-dropdown,.arco-trigger-popup,.n-base-select-menu,.ivu-select-dropdown,.semi-select-dropdown,.t-select__dropdown,.t-popup,.ant-picker-dropdown,.ant-picker-panel,.el-picker-panel,.el-time-panel,.arco-picker-panel,[role="listbox"]', PLATFORM_POPUP_SELECTOR].filter(Boolean).join(',')
+  const WATCH_WIDGET = ['.ant-select,.el-select,.arco-select,.n-select,.ivu-select,.ant-radio-group,.el-radio-group,.arco-radio-group,.n-radio-group,.ivu-radio-group,.van-radio-group,.t-radio-group,.semi-radio-group,[role="radiogroup"],.ant-picker,.el-date-editor,.arco-picker,.el-time-select,[class*="date-picker"],[class*="time-picker"]', PLATFORM_SELECT_SELECTOR, PLATFORM_DATE_SELECTOR, PLATFORM_RADIO_GROUP_SELECTOR].filter(Boolean).join(',')
   const OPEN_CHOICE = '.ant-select-open,.ant-select-focused,.el-select.is-focused,.ant-picker-focused,.el-date-editor.is-active,.arco-select-open,.arco-picker-focused'
-  const OPTION_NODE = '[role="option"],.ant-select-item-option,.ant-select-item,.el-select-dropdown__item,.arco-select-option,.n-base-select-option,.semi-select-option,.t-select-option,.ivu-select-item,.ant-cascader-menu-item,.el-cascader-node,[class*="select-option"],[class*="dropdown-item"]'
-  const CHOICE_BOX = 'label,.el-radio,.el-radio-button,.el-checkbox,.ant-radio-wrapper,.ant-radio-button-wrapper,.arco-radio,.n-radio,.ivu-radio-wrapper,.van-radio,.t-radio,.semi-radio,[role="radio"],[role="checkbox"]'
+  const OPTION_NODE = ['[role="option"],.ant-select-item-option,.ant-select-item,.el-select-dropdown__item,.arco-select-option,.n-base-select-option,.semi-select-option,.t-select-option,.ivu-select-item,.ant-cascader-menu-item,.el-cascader-node,[class*="select-option"],[class*="dropdown-item"]', PLATFORM_OPTION_SELECTOR].filter(Boolean).join(',')
+  const CHOICE_BOX = ['label,.el-radio,.el-radio-button,.el-checkbox,.ant-radio-wrapper,.ant-radio-button-wrapper,.arco-radio,.n-radio,.ivu-radio-wrapper,.van-radio,.t-radio,.semi-radio,[role="radio"],[role="checkbox"]', PLATFORM_CHOICE_WRAPPER_SELECTOR].filter(Boolean).join(',')
 
   function choicePopupOpen(ref: FieldRef): boolean {
     const host = ref.element.closest(WATCH_WIDGET) || ref.element
@@ -110,6 +124,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (!ref.element.isConnected) {
       const output = scanPage()
       refs = output.refs
+      scannedFields = output.fields
       const rebound = refs.get(fingerprint)
       if (!rebound) return
       current = rebound
@@ -181,6 +196,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (!nativeField && !looksLikeChoice(target)) return undefined
     const output = scanPage()
     refs = output.refs
+    scannedFields = output.fields
     watchLearnedInputs()
     return matchRef(target, refs)
   }
@@ -282,15 +298,19 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     ])
     const output = scanPage()
     refs = output.refs
+    scannedFields = output.fields
     if (probeOptions) await probeEmptyChoiceOptions(output.fields, refs).catch(() => undefined)
     hasScanned = true
     lastFingerprints = new Set(output.fields.map(field => field.fingerprint))
     for (const field of output.fields) {
       const scores = scoreFieldSlots(field, { siteRules: rules, learnedAliases })
       const decision = decideSlot(scores, field.sectionId)
+      const qualified = inferQualifiedField(field)
       field.slotCandidates = decision.candidates
-      field.slotStatus = decision.status
-      field.slot = decision.slot
+      field.recordQualifier = qualified?.qualifier
+      field.slotStatus = decision.status === 'resolved' || !qualified?.slot ? decision.status : 'resolved'
+      field.slot = decision.slot || qualified?.slot
+      field.diagnostics = scanDiagnostics(field)
       if (decision.candidates[0]?.signals.learnedAlias) field.learnedAlias = normalize(field.label)
       if (decision.candidates[0]?.signals.siteRule) {
         field.ruleId = findSiteRule(rules, field)?.id
@@ -307,13 +327,17 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (existing?.element.isConnected) return existing
     const output = scanPage()
     refs = output.refs
+    scannedFields = output.fields
     watchLearnedInputs()
     return refs.get(fingerprint)
   }
 
   function elementsOf(ref: FieldRef): HTMLElement[] {
     if (ref.kind === 'radio') return [...(ref.radios || []), ...(ref.choices || [])]
-    if (ref.kind === 'checkbox') return ref.checkboxes || [ref.element as HTMLInputElement]
+    if (ref.kind === 'checkbox') {
+      const choices: HTMLElement[] = [...(ref.checkboxes || []), ...(ref.choices || [])]
+      return choices.length ? choices : [ref.element]
+    }
     return [ref.element]
   }
 
@@ -344,13 +368,62 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     learnPaused = true
     try {
       if (resetUndo) undoStack = []
-      const recipes = await loadFillRecipes(location.hostname).catch(() => [])
-      const prepared = values.map(request => ({
-        ...request,
-        priorValues: priorValuesFor(recipeFor(recipes, request.slot), request.value)
-      }))
+      const domain = location.hostname
+      const [recipes, strategies, dependencies] = await Promise.all([
+        loadFillRecipes(domain).catch(() => []),
+        loadInteractionStrategies(domain).catch(() => []),
+        loadFieldDependencies(domain).catch(() => [])
+      ])
+      if (!refs.size) {
+        const initial = scanPage()
+        refs = initial.refs
+        scannedFields = initial.fields
+      }
+      let optionStates = captureOptionStates(scannedFields)
+      const prepared = applyLearnedDependencies(values.map(request => {
+        const ref = refs.get(request.fieldId)
+        const controlType = ref?.control?.type || ref?.kind || 'unknown'
+        return {
+          ...request,
+          priorValues: priorValuesFor(recipeFor(recipes, request.slot), request.value),
+          preferredStrategy: preferredStrategyFor(strategies, request.slot, controlType)
+        }
+      }), dependencies)
       const results: FillResult[] = []
-      const executions = await executeFillSequence(prepared, fieldId => locateRef(fieldId))
+      // 顶层页面在批量开始时立即预热扩展内 OCR；普通字段继续走 DOM，互不等待。
+      // iframe 坐标相对其自身视口，未校准到顶层前不做真实坐标点击，避免误点。
+      const visualRecovery = IS_COORDINATOR ? createVisualRecovery() : undefined
+      const executions = await executeFillSequence(prepared, fieldId => locateRef(fieldId), visualRecovery, {
+        async after(request, execution, ref) {
+          const controlType = ref?.control?.type || ref?.kind || 'unknown'
+          const strategy = successfulStrategy(execution.result)
+          const learning: Array<Promise<unknown>> = [recordQualityResult(domain, controlType, execution.result)]
+          const preferredFailed = Boolean(request.preferredStrategy && execution.result.trace
+            ?.some(step => step.strategy === request.preferredStrategy && step.status === 'failed'))
+          if (strategy) learning.push(recordInteractionStrategy(domain, request.slot, controlType, strategy, true))
+          if (request.preferredStrategy && preferredFailed && strategy !== request.preferredStrategy) {
+            learning.push(recordInteractionStrategy(domain, request.slot, controlType, request.preferredStrategy, false))
+          }
+          if (request.dependsOn?.length && (execution.result.status === 'filled'
+            || execution.result.reasonCode === 'no-matching-option'
+            || execution.result.reasonCode === 'option-list-not-found')) {
+            learning.push(recordDependencyOutcome(domain, request.fieldId, request.dependsOn, execution.result.status === 'filled'))
+          }
+          await Promise.all(learning.map(task => task.catch(() => undefined)))
+          if (execution.result.status !== 'filled') return
+          const parentType = ref?.control?.type || ref?.kind
+          if (!['single-choice', 'multi-choice', 'select', 'multi-select', 'cascade', 'radio', 'checkbox', 'combobox', 'multiselect'].includes(parentType || '')) return
+          // 父字段回读成功后再观察子字段选项，避免把写入失败当成联动证据。
+          await wait(120)
+          const rescanned = scanPage()
+          const nextStates = captureOptionStates(rescanned.fields)
+          const changed = changedOptionFields(optionStates, nextStates, request.fieldId)
+          if (changed.length) await recordFieldDependencies(domain, request.fieldId, changed).catch(() => undefined)
+          scannedFields = rescanned.fields
+          optionStates = nextStates
+        }
+      })
+      watchLearnedInputs()
       for (const execution of executions) {
         if (execution.result.status === 'filled' && execution.undo) {
           undoStack.push(execution.undo)
@@ -376,6 +449,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     if (stale) {
       const output = scanPage()
       refs = output.refs
+      scannedFields = output.fields
       watchLearnedInputs()
     }
     const values: Array<{ fieldId: string; value: string }> = []
@@ -491,6 +565,16 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   }
 
   chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number; probeOptions?: boolean; demands?: Array<{ section: string; missing: number }> }, _sender, respond) => {
+    if (message.type === 'PANEL_OPEN' && IS_COORDINATOR) {
+      mountPanel()
+      respond({})
+      return false
+    }
+    if (message.type === 'PANEL_CLOSE' && IS_COORDINATOR) {
+      closePanelView()
+      respond({})
+      return false
+    }
     if (message.type === 'FRAME_SCAN') {
       denyUnlessLicensed(respond, () => {
         frameScan(message.probeOptions === true).then(respond).catch(error => respond({ error: String(error) }))
@@ -569,7 +653,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     return response?.frameIds?.length ? response.frameIds : [0]
   }
 
-  async function aggregateScan(probeOptions = false): Promise<{ fields: FormField[]; context: { pageTitle: string; url: string; frames: Array<{ frameId: number; url: string; fieldCount: number }> } }> {
+  async function aggregateScan(probeOptions = false): Promise<{ fields: FormField[]; context: { pageTitle: string; url: string; frames: Array<{ frameId: number; url: string; fieldCount: number }>; platformId?: string; platformName?: string } }> {
     const frameIds = await listFrames()
     const fields: FormField[] = []
     const frames: Array<{ frameId: number; url: string; fieldCount: number }> = []
@@ -585,10 +669,15 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       frames.push({ frameId, url: response.url || '', fieldCount: response.fields.length })
       if (frameId === 0 && response.title) pageTitle = response.title
     }
-    return { fields, context: { pageTitle, url: location.href, frames } }
+    const topPlatform = fields.find(field => field.frameId === 0 && field.platformId) || fields.find(field => field.platformId)
+    const platformName = topPlatform?.platformId === 'moka-web' ? 'Moka 招聘'
+      : topPlatform?.platformId === 'beisen-phoenix' ? '北森招聘 Phoenix'
+        : topPlatform?.platformId === 'beisen-legacy' ? '北森招聘旧版/iTalent'
+          : topPlatform?.platformId === 'feishu-jobs' ? '飞书招聘' : undefined
+    return { fields, context: { pageTitle, url: location.href, frames, platformId: topPlatform?.platformId, platformName } }
   }
 
-  async function aggregateFill(values: FillRequest[]): Promise<FillResult[]> {
+  async function aggregateFill(values: FillRequest[], resetUndo = true): Promise<FillResult[]> {
     const groups = new Map<number, FillRequest[]>()
     for (const request of values) {
       const { frameId, fingerprint } = splitFieldId(request.fieldId)
@@ -596,9 +685,17 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       list.push({ ...request, fieldId: fingerprint })
       groups.set(frameId, list)
     }
+    // 两阶段填写的第一批必须清空所有 frame 的旧撤销栈；第二批再追加，
+    // 这样一次“撤销”能同时恢复身份字段和后续字段。
+    if (resetUndo) {
+      const frameIds = await listFrames()
+      for (const frameId of frameIds.filter(id => !groups.has(id))) {
+        await frameCall(frameId, { type: 'FRAME_FILL', values: [], resetUndo: true }).catch(() => null)
+      }
+    }
     const results: FillResult[] = []
     for (const [frameId, group] of groups) {
-      const response = await frameCall<{ results?: FillResult[]; error?: string } | null>(frameId, { type: 'FRAME_FILL', values: group, resetUndo: true }).catch(() => null)
+      const response = await frameCall<{ results?: FillResult[]; error?: string } | null>(frameId, { type: 'FRAME_FILL', values: group, resetUndo }).catch(() => null)
       for (const result of response?.results || group.map(request => ({ fieldId: request.fieldId, status: 'failed' as const, message: '目标 frame 无响应', reasonCode: 'element-lost' as const }))) {
         results.push({ ...result, fieldId: fieldIdOf(frameId, result.fieldId) })
       }
@@ -772,10 +869,17 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     panelFrame = null
   }
 
+  function closePanelManually(): void {
+    closePanelView()
+    chrome.runtime.sendMessage({ type: 'PANEL_VISIBILITY_CHANGED', open: false }).catch(() => undefined)
+  }
+
   function mountPanel(): void {
     if (panelHost) {
-      panelHost.hidden = !panelHost.hidden
-      if (!panelHost.hidden) requestAnimationFrame(ensurePanelInViewport)
+      // 后台可能在首次注入完成后、或多个 onUpdated 事件中重复要求显示。
+      // 这里必须幂等，不能把重复的“打开”误当成切换并再次隐藏。
+      panelHost.hidden = false
+      requestAnimationFrame(ensurePanelInViewport)
       return
     }
     panelHost = document.createElement('div')
@@ -865,11 +969,12 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   // ─── 面板消息路由（仅 COORDINATOR）──────────────────────────
 
-  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; probeOptions?: boolean; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
+  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; probeOptions?: boolean; resetUndo?: boolean; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
     if (!(await loadLicense())) return { error: LICENSE_REQUIRED_MESSAGE }
     if (message.type === 'SCAN') return aggregateScan(message.probeOptions === true)
+    if (message.type === 'VISUAL_STATUS') return warmupVisualAssist()
     if (message.type === 'EXPAND_REPEATS') return aggregateExpand(message.demands || [])
-    if (message.type === 'FILL') return aggregateFill(message.values || []).then(results => ({ results }))
+    if (message.type === 'FILL') return aggregateFill(message.values || [], message.resetUndo !== false).then(results => ({ results }))
     if (message.type === 'UNDO') return aggregateUndo().then(results => ({ results }))
     if (message.type === 'READ_VALUES') return aggregateValues()
     if (message.type === 'MANUAL_FILL') return manualFill(message as { fieldId: string; value: string; source?: FillRequest['source']; confidence?: number; copied?: boolean })
@@ -888,7 +993,8 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     window.addEventListener('message', event => {
       if (!panelFrame || event.source !== panelFrame.contentWindow || event.origin !== panelOrigin || event.data?.type !== 'PANEL_REQUEST') return
       const { requestId, message } = event.data as { requestId: string; message: { type: string; mode?: 'compact' | 'expanded' | 'activation'; clientX?: number; clientY?: number } }
-      if (message.type === 'CLOSE_PANEL' || message.type === 'MINIMIZE_PANEL') { closePanelView(); return }
+      if (message.type === 'CLOSE_PANEL') { closePanelManually(); return }
+      if (message.type === 'MINIMIZE_PANEL') { closePanelView(); return }
       if (message.type === 'RESIZE_PANEL') { resizePanelHost(message.mode || 'compact'); return }
       if (message.type === 'DRAG_PANEL') { startPanelDrag(message.clientX || 0, message.clientY || 0); return }
       handlePanelMessage(message as Parameters<typeof handlePanelMessage>[0]).then(response => {
@@ -900,11 +1006,5 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
     mountPanel()
     window.addEventListener('resize', ensurePanelInViewport, { passive: true })
-    window.addEventListener(TOGGLE_EVENT, () => {
-      if (panelHost) closePanelView()
-      else mountPanel()
-    })
   }
-} else if (IS_COORDINATOR) {
-  window.dispatchEvent(new CustomEvent(TOGGLE_EVENT))
 }

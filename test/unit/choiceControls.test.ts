@@ -313,6 +313,65 @@ describe('下拉框与单选的识别、填写', () => {
     expect(document.querySelector('.el-select__selected-item')?.textContent).toBe('硕士')
   })
 
+  it('open Shadow DOM 内的下拉浮层能够定位并回填', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const shadow = host.attachShadow({ mode: 'open' })
+    shadow.innerHTML = `
+      <label>学历</label>
+      <div class="el-select"><div class="el-select__wrapper"><input readonly placeholder="请选择"></div></div>`
+    const select = shadow.querySelector<HTMLElement>('.el-select')!
+    const dropdown = document.createElement('div')
+    dropdown.className = 'el-select-dropdown'
+    dropdown.innerHTML = `
+      <div class="el-select-dropdown__item">本科</div>
+      <div class="el-select-dropdown__item">硕士</div>`
+    select.addEventListener('click', () => {
+      if (!dropdown.isConnected) shadow.append(dropdown)
+    })
+    dropdown.querySelectorAll<HTMLElement>('.el-select-dropdown__item')[1].addEventListener('click', () => {
+      const selected = document.createElement('span')
+      selected.className = 'el-select__selected-item'
+      selected.textContent = '硕士'
+      select.append(selected)
+      dropdown.remove()
+    })
+    const scanned = scanPage()
+    const field = scanned.fields.find(item => item.kind === 'combobox')!
+    const ref = scanned.refs.get(field.fingerprint)!
+    const execution = await executeFill({ fieldId: field.id, value: '硕士' }, () => ref)
+    expect(execution.result.status).toBe('filled')
+    expect(select.querySelector('.el-select__selected-item')?.textContent).toBe('硕士')
+  })
+
+  it('没有组件类名和 ARIA 的新浮层按渲染选项组兜底回填', async () => {
+    document.body.innerHTML = `
+      <label for="degree">学历</label>
+      <div id="degree" role="combobox"><input readonly placeholder="请选择"></div>`
+    const trigger = document.querySelector<HTMLElement>('#degree')!
+    const input = trigger.querySelector<HTMLInputElement>('input')!
+    trigger.addEventListener('click', () => {
+      if (document.querySelector('[data-test-menu]')) return
+      const popup = document.createElement('div')
+      popup.dataset.testMenu = 'true'
+      popup.style.position = 'absolute'
+      popup.innerHTML = '<div>本科</div><div>硕士</div>'
+      popup.children[1].addEventListener('click', () => {
+        input.readOnly = false
+        input.value = '硕士'
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        popup.remove()
+      })
+      document.body.append(popup)
+    })
+    const scanned = scanPage()
+    const field = scanned.fields.find(item => item.kind === 'combobox')!
+    const ref = scanned.refs.get(field.fingerprint)!
+    const execution = await executeFill({ fieldId: field.id, value: '硕士' }, () => ref)
+    expect(execution.result.status).toBe('filled')
+    expect(input.value).toBe('硕士')
+  })
+
   it('时间输入按 HH:mm 写入', async () => {
     document.body.innerHTML = '<input type="time">'
     const scanned = scanPage()

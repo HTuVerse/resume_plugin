@@ -1,4 +1,5 @@
 import { isElementVisible, pollUntil } from './domUtils'
+import { PLATFORM_OPTION_SELECTOR, PLATFORM_POPUP_SELECTOR } from '../platforms/registry'
 
 /**
  * 下拉浮层精确定位（F10，TECH_DESIGN §8.3）。
@@ -19,7 +20,9 @@ const POPUP_SELECTOR = [
   '.el-select-dropdown', '.el-cascader__dropdown', '.el-picker-panel', '.el-popper',
   '.arco-select-dropdown', '.n-base-select-menu', '.ivu-select-dropdown',
   '.semi-select-dropdown', '.t-select__dropdown',
-  '[role="listbox"]', '[class*="dropdown"]', '[class*="popper"]', '[class*="popup"]'
+  '[role="listbox"]', '[role="menu"]', '[role="tree"]', '[role="grid"]',
+  '[data-popper-placement]', '[class*="dropdown"]', '[class*="popper"]', '[class*="popup"]',
+  PLATFORM_POPUP_SELECTOR
 ].join(',')
 
 export const OPTION_SELECTOR = [
@@ -31,11 +34,91 @@ export const OPTION_SELECTOR = [
   '.semi-select-option',
   '.t-select-option',
   '.ivu-select-item',
+  '.ant-cascader-menu-item:not(.ant-cascader-menu-item-disabled)',
+  '.el-cascader-node:not(.is-disabled)',
+  '.arco-cascader-option:not(.arco-cascader-option-disabled)',
   '.time-select-item',
+  '[role="menuitem"]:not([aria-disabled="true"])',
+  '[role="treeitem"]:not([aria-disabled="true"])',
+  '[data-option]:not([aria-disabled="true"])',
   '[class*="select-option"]',
   '[class*="dropdown-item"]',
+  PLATFORM_OPTION_SELECTOR,
   'li:not([aria-disabled="true"])'
 ].join(',')
+
+type PopupRoot = Document | ShadowRoot
+const inferredOptions = new WeakMap<HTMLElement, HTMLElement[]>()
+
+/**
+ * querySelectorAll 不会穿透 shadow boundary。扫描器会识别 open Shadow DOM
+ * 中的控件，因此浮层定位也必须枚举相同的根，否则会出现“识别得到、填写找不到”。
+ */
+function popupRoots(trigger: HTMLElement): PopupRoot[] {
+  const roots: PopupRoot[] = []
+  const seen = new Set<PopupRoot>()
+  const add = (root: PopupRoot) => {
+    if (seen.has(root)) return
+    seen.add(root)
+    roots.push(root)
+    for (const host of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+      if (host.shadowRoot) add(host.shadowRoot)
+    }
+  }
+  const ownRoot = trigger.getRootNode()
+  if (ownRoot instanceof Document || ownRoot instanceof ShadowRoot) add(ownRoot)
+  if (ownRoot !== document) add(document)
+  return roots
+}
+
+function popupCandidates(trigger: HTMLElement): HTMLElement[] {
+  const unique = new Set<HTMLElement>()
+  for (const root of popupRoots(trigger)) {
+    for (const popup of Array.from(root.querySelectorAll<HTMLElement>(POPUP_SELECTOR))) unique.add(popup)
+  }
+  return [...unique]
+}
+
+function compactText(element: HTMLElement): string {
+  return (element.textContent || '').replace(/\s+/g, ' ').trim()
+}
+
+function plausiblePopupGeometry(container: HTMLElement, trigger: HTMLElement): boolean {
+  const style = getComputedStyle(container)
+  if (style.position === 'absolute' || style.position === 'fixed' || container.matches('[role="listbox"],[role="menu"],[role="tree"],[role="grid"]')) return true
+  const triggerRect = trigger.getBoundingClientRect()
+  const rect = container.getBoundingClientRect()
+  // jsdom 及尚未完成布局的页面会返回全 0；真正浏览器中则限制在控件附近，降低误点风险。
+  if (!rect.width && !rect.height && !triggerRect.width && !triggerRect.height) return true
+  const dx = Math.max(triggerRect.left - rect.right, rect.left - triggerRect.right, 0)
+  const dy = Math.max(triggerRect.top - rect.bottom, rect.top - triggerRect.bottom, 0)
+  return Math.hypot(dx, dy) <= 320
+}
+
+/**
+ * 视觉兜底的第一层：只分析“点击后新出现”的渲染节点。
+ * 对没有 role/class 的自绘菜单，以短文本同级项推断选项组；不扫描整页，避免误点正文。
+ */
+function inferPopupContainers(node: HTMLElement, trigger: HTMLElement): HTMLElement[] {
+  const inspected = [node, ...Array.from(node.querySelectorAll<HTMLElement>('*')).slice(0, 500)]
+  const inferred: HTMLElement[] = []
+  for (const container of inspected) {
+    if (!isElementVisible(container) || container.contains(trigger) || !plausiblePopupGeometry(container, trigger)) continue
+    const children = Array.from(container.children).filter((child): child is HTMLElement => child instanceof HTMLElement)
+    if (children.length < 2 || children.length > 80) continue
+    const options = children.filter(child => {
+      if (!isElementVisible(child) || child.querySelector('input,textarea,select')) return false
+      const text = compactText(child)
+      return Boolean(text) && text.length <= 80
+    })
+    const labels = new Set(options.map(compactText))
+    if (options.length < 2 || labels.size < 2) continue
+    inferredOptions.set(container, options)
+    inferred.push(container)
+  }
+  // 外层 portal 和内层菜单同时命中时，只保留最内层的选项组。
+  return inferred.filter(container => !inferred.some(other => other !== container && container.contains(other)))
+}
 
 function isPopupCandidate(element: Element): element is HTMLElement {
   return element instanceof HTMLElement
@@ -81,7 +164,7 @@ export function visiblePopupFor(trigger: HTMLElement): HTMLElement | null {
   if (ariaPopup?.querySelector(OPTION_SELECTOR)) return ariaPopup
 
   const rect = trigger.getBoundingClientRect()
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>(POPUP_SELECTOR))
+  const candidates = popupCandidates(trigger)
     .filter(popup => isElementVisible(popup) && popup.querySelector(OPTION_SELECTOR))
     .map(popup => {
       const popupRect = popup.getBoundingClientRect()
@@ -108,21 +191,28 @@ export interface PopupWatch {
 export function watchForPopup(trigger: HTMLElement): PopupWatch {
   const appeared = new Set<HTMLElement>()
   const visibleBefore = new Set<HTMLElement>(
-    Array.from(document.querySelectorAll<HTMLElement>(POPUP_SELECTOR)).filter(isElementVisible)
+    popupCandidates(trigger).filter(isElementVisible)
   )
+  const rootsBefore = popupRoots(trigger)
   const observer = new MutationObserver(records => {
     for (const record of records) {
       for (const node of Array.from(record.addedNodes)) {
         if (!(node instanceof HTMLElement)) continue
         if (isPopupCandidate(node)) appeared.add(node)
         for (const popup of Array.from(node.querySelectorAll<HTMLElement>(POPUP_SELECTOR))) appeared.add(popup)
+        for (const popup of inferPopupContainers(node, trigger)) appeared.add(popup)
       }
       if (record.type === 'attributes' && record.target instanceof HTMLElement && isPopupCandidate(record.target)) {
         appeared.add(record.target)
+      } else if (record.type === 'attributes' && record.target instanceof HTMLElement) {
+        for (const popup of inferPopupContainers(record.target, trigger)) appeared.add(popup)
       }
     }
   })
-  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] })
+  for (const root of rootsBefore) {
+    const observed = root instanceof Document ? root.body || root.documentElement : root
+    if (observed) observer.observe(observed, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] })
+  }
 
   const locate = async (timeoutMs = 1500): Promise<HTMLElement | null> => {
     const found = await pollUntil<HTMLElement | null>(() => {
@@ -131,7 +221,8 @@ export function watchForPopup(trigger: HTMLElement): PopupWatch {
       if (ariaPopup) return ariaPopup
       // 3. 变更观测：点击后新出现/转可见的浮层
       const observed = Array.from(appeared).filter(popup => popup.isConnected && isElementVisible(popup) && !visibleBefore.has(popup))
-      const opened = Array.from(document.querySelectorAll<HTMLElement>(POPUP_SELECTOR))
+      // 每次重枚举 open shadow roots：点击可能刚创建 portal host / shadow root。
+      const opened = popupCandidates(trigger)
         .filter(popup => isElementVisible(popup) && !visibleBefore.has(popup))
       const fresh = opened.length ? opened : observed
       if (fresh.length === 1) return fresh[0]
@@ -154,6 +245,7 @@ export function watchForPopup(trigger: HTMLElement): PopupWatch {
 /** 在已锁定的浮层内取可见选项（作用域收紧，禁止全局查询）。 */
 export function popupOptions(popup: HTMLElement): HTMLElement[] {
   const all = Array.from(popup.querySelectorAll<HTMLElement>(OPTION_SELECTOR)).filter(isElementVisible)
+  if (!all.length) return (inferredOptions.get(popup) || []).filter(option => option.isConnected && isElementVisible(option))
   // li 兜底选择器可能命中嵌套结构，去掉包含其他选项的外层节点
   return all.filter(option => !all.some(other => other !== option && option.contains(other)))
 }

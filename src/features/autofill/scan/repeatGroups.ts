@@ -1,4 +1,5 @@
 import { shortHash, structuralPath } from './fingerprint'
+import { PLATFORM_LABEL_SELECTOR, platformAdapterForElement, platformRepeatContainer } from '../platforms/registry'
 
 /**
  * 重复段聚类（F06）：同构兄弟节点聚类，替换固定 class 白名单。
@@ -53,7 +54,8 @@ function isSingleQuestion(element: HTMLElement): boolean {
 
 function labelMultiset(element: HTMLElement): Map<string, number> {
   const set = new Map<string, number>()
-  for (const label of Array.from(element.querySelectorAll('label,.ant-form-item-label,.el-form-item__label,.label'))) {
+  const selector = ['label,.ant-form-item-label,.el-form-item__label,.label', PLATFORM_LABEL_SELECTOR].filter(Boolean).join(',')
+  for (const label of Array.from(element.querySelectorAll(selector))) {
     const text = (label.textContent || '').replace(/\s+/g, '').slice(0, 40)
     if (!text) continue
     set.set(text, (set.get(text) || 0) + 1)
@@ -75,6 +77,12 @@ function jaccard(a: Map<string, number>, b: Map<string, number>): number {
   return union ? intersection / union : 0
 }
 
+function sharedLabelCount(a: Map<string, number>, b: Map<string, number>): number {
+  let count = 0
+  for (const key of a.keys()) count += Math.min(a.get(key) || 0, b.get(key) || 0)
+  return count
+}
+
 function isRepeatSibling(candidate: HTMLElement, reference: HTMLElement, referenceControls: number, referenceLabels: Map<string, number>): boolean {
   if (candidate === reference) return true
   if (candidate.tagName !== reference.tagName) return false
@@ -83,7 +91,11 @@ function isRepeatSibling(candidate: HTMLElement, reference: HTMLElement, referen
   const candidateLabels = labelMultiset(candidate)
   // 行内没有标签、又只有一个控件时，是表单的上下两行，不是重复经历。
   if (!referenceLabels.size && !candidateLabels.size && referenceControls < 2) return false
-  return jaccard(candidateLabels, referenceLabels) >= LABEL_JACCARD_THRESHOLD
+  if (jaccard(candidateLabels, referenceLabels) >= LABEL_JACCARD_THRESHOLD) return true
+  // 一段少渲染了一个可选字段时，标签集合往往是一方包含另一方。
+  // 同 tag、同 class、控件数接近且较小集合全部重合，是比固定 0.6 阈值更稳的非同构兜底。
+  const smaller = Math.min(candidateLabels.size, referenceLabels.size)
+  return smaller > 0 && sharedLabelCount(candidateLabels, referenceLabels) >= smaller
 }
 
 /**
@@ -91,12 +103,37 @@ function isRepeatSibling(candidate: HTMLElement, reference: HTMLElement, referen
  * 非重复布局返回 null。
  */
 export function detectRepeatGroup(element: HTMLElement): RepeatGroupInfo | null {
+  const platformContainer = platformRepeatContainer(element)
+  if (platformContainer?.parentElement) {
+    const adapter = platformAdapterForElement(element)
+    const siblings = adapter
+      ? Array.from(platformContainer.parentElement.children).filter((child): child is HTMLElement =>
+        child instanceof HTMLElement && child.matches(adapter.selectors.repeatItem))
+      : [platformContainer]
+    const peers = siblings.length ? siblings : [platformContainer]
+    return {
+      repeatGroupId: `platform-${adapter?.id || 'ats'}-${shortHash(structuralPath(platformContainer.parentElement))}-${shortHash(classSignature(platformContainer))}`,
+      item: Math.max(1, peers.indexOf(platformContainer) + 1),
+      container: platformContainer
+    }
+  }
   let node: HTMLElement | null = element.parentElement
   for (let depth = 0; node && depth < MAX_ANCESTOR_DEPTH; depth += 1, node = node.parentElement) {
     const parent = node.parentElement
     if (!parent || parent === document.documentElement) continue
-    // 一组单选或单独一行不是重复经历，继续往外找整段
-    if (isSingleQuestion(node)) continue
+    // 一组单选或单独一行通常不是重复经历。例外：同 class 兄弟明显是更完整的同构段，
+    // 当前段只是少了可选字段，不能因此把它排除。
+    if (isSingleQuestion(node)) {
+      const labels = labelMultiset(node)
+      const hasLargerPeer = Array.from(parent.children).some(candidate => candidate instanceof HTMLElement
+        && candidate !== node
+        && candidate.tagName === node!.tagName
+        && classSignature(candidate) === classSignature(node!)
+        && controlCount(candidate) > controlCount(node!)
+        && labels.size > 0
+        && sharedLabelCount(labelMultiset(candidate), labels) >= labels.size)
+      if (!hasLargerPeer) continue
+    }
     // 容器需要有一定体量（至少含 1 个控件），避免把单个输入框的包装误判为段
     const controls = controlCount(node)
     if (!controls) continue
@@ -134,11 +171,29 @@ function buttonIn(node: HTMLElement): HTMLElement | null {
   return Array.from(node.querySelectorAll<HTMLElement>('button,[role="button"],a')).find(isRepeatAddButton) || null
 }
 
+/** Phoenix 等页面会把“添加经历”按钮放在记录容器内部或同一模块底部。 */
+function platformButtonNear(container: HTMLElement): HTMLElement | null {
+  const adapter = platformAdapterForElement(container)
+  if (!adapter?.selectors.addButton) return null
+  let scope: HTMLElement | null = container
+  for (let depth = 0; scope && depth < 4; depth += 1, scope = scope.parentElement) {
+    let candidates: HTMLElement[] = []
+    try { candidates = Array.from(scope.querySelectorAll<HTMLElement>(adapter.selectors.addButton)) } catch { return null }
+    const hit = candidates.find(candidate => isRepeatAddButton(candidate)
+      && !candidate.closest('[data-resume-assistant]')
+      && !candidate.closest('[class*="upload"],[class*="attachment"]'))
+    if (hit) return hit
+  }
+  return null
+}
+
 /**
  * 定位重复段的「新增一段」按钮（F17）。
  * 只看容器后面的兄弟，以及容器父节点后面的兄弟，不在整页里乱点「添加」。
  */
 export function findAddButton(container: HTMLElement): HTMLElement | null {
+  const platformHit = platformButtonNear(container)
+  if (platformHit) return platformHit
   let sibling = container.nextElementSibling
   for (let index = 0; sibling && index < 4; index += 1, sibling = sibling.nextElementSibling) {
     if (!(sibling instanceof HTMLElement) || container.contains(sibling)) continue

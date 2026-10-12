@@ -1,6 +1,14 @@
 import type { LabelSource } from '../../../domain/types'
 import { looksLikeFieldPrompt, plainChoiceText } from '../../ontology/optionMatch'
 import { sectionOfText } from '../../ontology/sections'
+import {
+  PLATFORM_CHOICE_WRAPPER_SELECTOR,
+  PLATFORM_FORM_ITEM_SELECTOR,
+  PLATFORM_LABEL_SELECTOR,
+  PLATFORM_RADIO_GROUP_SELECTOR,
+  PLATFORM_CHECKBOX_GROUP_SELECTOR,
+  PLATFORM_OPTION_SELECTOR
+} from '../platforms/registry'
 
 /**
  * 标签抽取（从旧 content.labelOf 迁出，F02 前置）。
@@ -15,9 +23,9 @@ export interface ResolvedLabel {
 }
 
 /** 表单项容器选择器：由识别器补充（§4.2），此处是通用兜底集合。 */
-const FORM_ITEM_SELECTOR = '.ant-form-item,.el-form-item,.arco-form-item,.n-form-item,.ivu-form-item,.form-group,.form-item,.field,[data-field]'
-const FORM_ITEM_LABEL_SELECTOR = 'label,.ant-form-item-label,.el-form-item__label,.arco-form-item-label,.n-form-item-label,.ivu-form-item-label,legend,.label'
-const CHOICE_GROUP_SELECTOR = '[role="radiogroup"],[role="group"],.ant-radio-group,.el-radio-group,.arco-radio-group,.ant-checkbox-group,.el-checkbox-group,fieldset'
+const FORM_ITEM_SELECTOR = ['.ant-form-item,.el-form-item,.arco-form-item,.n-form-item,.ivu-form-item,.form-group,.form-item,.field,[data-field]', PLATFORM_FORM_ITEM_SELECTOR].filter(Boolean).join(',')
+const FORM_ITEM_LABEL_SELECTOR = ['label,.ant-form-item-label,.el-form-item__label,.arco-form-item-label,.n-form-item-label,.ivu-form-item-label,legend,.label', PLATFORM_LABEL_SELECTOR].filter(Boolean).join(',')
+const CHOICE_GROUP_SELECTOR = ['[role="radiogroup"],[role="group"],.ant-radio-group,.el-radio-group,.arco-radio-group,.ant-checkbox-group,.el-checkbox-group,fieldset', PLATFORM_RADIO_GROUP_SELECTOR, PLATFORM_CHECKBOX_GROUP_SELECTOR].filter(Boolean).join(',')
 
 function cleanText(text: string | null | undefined): string {
   return String(text || '')
@@ -168,7 +176,7 @@ function shortOptionText(text: string): string {
 export function visibleChoiceText(element: HTMLElement): string {
   const title = shortOptionText(element.getAttribute('title') || '')
   if (title) return title
-  const labelled = element.querySelector('.el-radio__label,.el-checkbox__label,.el-radio-button__inner,.ant-select-item-option-content,.el-select-dropdown__item span')
+  const labelled = element.querySelector(['.el-radio__label,.el-checkbox__label,.el-radio-button__inner,.ant-select-item-option-content,.el-select-dropdown__item span', PLATFORM_OPTION_SELECTOR].filter(Boolean).join(','))
   const fromLabel = labelled ? shortOptionText(labelled.textContent || '') : ''
   if (fromLabel) return fromLabel
   return shortOptionText(element.textContent || '')
@@ -180,7 +188,7 @@ export function visibleChoiceText(element: HTMLElement): string {
  * 学习时必须用看得见的文字，不能把内部编码写进知识库。
  */
 export function optionLabel(element: HTMLElement): string {
-  const component = element.closest('.el-radio,.el-checkbox,.ant-radio-wrapper,.ant-radio-button-wrapper,.arco-radio,.el-radio-button')
+  const component = element.closest(['.el-radio,.el-checkbox,.ant-radio-wrapper,.ant-radio-button-wrapper,.arco-radio,.el-radio-button', PLATFORM_CHOICE_WRAPPER_SELECTOR].filter(Boolean).join(','))
   const explicit = component?.querySelector('.el-radio__label,.el-checkbox__label,.el-radio-button__inner')
   const explicitText = explicit ? shortOptionText(explicit.textContent || '') : ''
   if (explicitText) return explicitText
@@ -192,7 +200,7 @@ export function optionLabel(element: HTMLElement): string {
     if (text && !crowded) return text
   }
 
-  const wrapper = element.closest('.ant-radio-wrapper,.ant-radio-button-wrapper,.el-radio,.el-radio-button,.arco-radio,.ant-checkbox-wrapper,.el-checkbox,[role="radio"],[role="checkbox"],label')
+  const wrapper = element.closest(['.ant-radio-wrapper,.ant-radio-button-wrapper,.el-radio,.el-radio-button,.arco-radio,.ant-checkbox-wrapper,.el-checkbox,[role="radio"],[role="checkbox"],label', PLATFORM_CHOICE_WRAPPER_SELECTOR].filter(Boolean).join(','))
   if (wrapper) {
     const inputs = wrapper.querySelectorAll('input[type="radio"],input[type="checkbox"],[role="radio"]')
     const text = shortOptionText(wrapper.textContent || '')

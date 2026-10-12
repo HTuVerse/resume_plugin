@@ -133,4 +133,67 @@ describe('valuesEquivalent（kind 感知回读比对）', () => {
     expect(parent.selectedOptions[0].text).toBe('工学')
     expect(child.selectedOptions[0].text).toBe('计算机')
   })
+
+  it('同一未分隔原值可按动态选项投影到多个联动控件', async () => {
+    document.body.innerHTML = `
+      <select id="parent"><option>请选择</option><option>工学</option><option>理学</option></select>
+      <select id="child"><option>请选择</option></select>`
+    const parent = document.querySelector<HTMLSelectElement>('#parent')!
+    const child = document.querySelector<HTMLSelectElement>('#child')!
+    parent.addEventListener('change', () => {
+      if (parent.selectedOptions[0]?.text !== '工学') return
+      child.innerHTML = '<option>请选择</option><option>计算机</option><option>机械</option>'
+    })
+    const refs = new Map<string, FieldRef>([
+      ['parent', { kind: 'select', element: parent }],
+      ['child', { kind: 'select', element: child }]
+    ])
+    const executions = await executeFillSequence([
+      { fieldId: 'parent', value: '工学计算机', valueMode: 'match-options', bindingGroupId: 'group-1' },
+      { fieldId: 'child', value: '工学计算机', valueMode: 'match-options', bindingGroupId: 'group-1', dependsOn: ['parent'] }
+    ], id => refs.get(id))
+    expect(executions.every(item => item.result.status === 'filled')).toBe(true)
+    expect(parent.selectedOptions[0].text).toBe('工学')
+    expect(child.selectedOptions[0].text).toBe('计算机')
+  })
+
+  it('自定义下拉排在稳定字段之后，失败也不阻塞其它字段', async () => {
+    document.body.innerHTML = `
+      <div id="custom" role="combobox"></div>
+      <input id="name" />`
+    const custom = document.querySelector<HTMLElement>('#custom')!
+    const name = document.querySelector<HTMLInputElement>('#name')!
+    const refs = new Map<string, FieldRef>([
+      ['custom', { kind: 'combobox', element: custom }],
+      ['name', { kind: 'text', element: name }]
+    ])
+    custom.remove()
+    const executions = await executeFillSequence([
+      { fieldId: 'custom', value: '不存在的选项' },
+      { fieldId: 'name', value: '张三' }
+    ], id => refs.get(id))
+    expect(name.value).toBe('张三')
+    expect(executions[0].result.fieldId).toBe('name')
+    expect(executions[0].result.status).toBe('filled')
+    expect(executions[1].result).toMatchObject({ fieldId: 'custom', status: 'failed', reasonCode: 'element-lost' })
+  })
+
+  it('DOM 选项失败后调用视觉恢复通道，并采用已验证的恢复结果', async () => {
+    document.body.innerHTML = '<select><option>请选择</option><option>本科</option></select>'
+    const ref: FieldRef = { kind: 'select', element: document.querySelector('select')! }
+    let recovered = false
+    const executions = await executeFillSequence(
+      [{ fieldId: 'degree', value: '硕士' }],
+      () => ref,
+      async (request, failed, receivedRef) => {
+        recovered = true
+        expect(request.fieldId).toBe('degree')
+        expect(failed.result.reasonCode).toBe('no-matching-option')
+        expect(receivedRef).toBe(ref)
+        return { result: { ...failed.result, status: 'filled', reasonCode: 'ok', message: '视觉确认' } }
+      }
+    )
+    expect(recovered).toBe(true)
+    expect(executions[0].result).toMatchObject({ status: 'filled', reasonCode: 'ok', message: '视觉确认' })
+  })
 })

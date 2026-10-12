@@ -52,28 +52,43 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
   if (['select', 'multiselect', 'radio', 'checkbox', 'combobox', 'cascade'].includes(field.kind)) {
     const usable = field.options.filter(option => option.trim() && !isPlaceholderOption(option))
     if (!usable.length) return { ok: true, value, needsConfirmation: false }
+    const complete = field.optionCoverage === 'complete'
+      || (field.optionCoverage == null && ['select', 'radio', 'checkbox'].includes(field.kind))
     const values = field.kind === 'multiselect' || field.kind === 'checkbox'
       ? value.split(/[,，、|/]/).map(item => item.trim()).filter(Boolean)
       : field.kind === 'cascade'
         ? splitCascadeValue(value)
         : [value]
     let converted: { from: string; to: string } | null = null
+    let weakConversion = false
     const matched: string[] = []
     for (const single of values) {
       const match = matchOption(field.options, single)
       if (match.index < 0) {
-        return { ok: false, reason: `选项集中找不到「${single}」的唯一匹配`, reasonCode: 'no-matching-option' }
+        // 自定义下拉、虚拟列表和联动控件通常只暴露当前渲染片段。
+        // 只有已证明完整的选项集，才有资格在执行前断言目标不存在。
+        if (complete) return { ok: false, reason: `完整选项集中找不到「${single}」的唯一匹配`, reasonCode: 'no-matching-option' }
+        matched.push(single)
+        continue
       }
       if (match.ambiguous) {
         return { ok: true, value, needsConfirmation: true, reason: `「${single}」在选项集中有多个匹配，请确认`, reasonCode: 'needs-confirmation' }
       }
       matched.push(field.options[match.index])
-      if (match.reason !== 'exact') converted = { from: single, to: field.options[match.index] }
+      if (match.reason !== 'exact') {
+        converted = { from: single, to: field.options[match.index] }
+        if (match.reason === 'prefix') weakConversion = true
+      }
     }
-    // 非全等命中（同义/等级/前缀）：给出转换后的待确认候选，不直接填入（PRD F04 验收）
+    // 维护词典中的唯一同义值和有序等级映射是确定性转换，可直接进入执行层，
+    // 最终仍由写入后的页面回读负责兜底。前缀匹配语义更弱，继续要求确认。
     if (converted) {
       if (values.length === 1) value = converted.to
       else if (field.kind === 'cascade') value = matched.join(' / ')
+      else if (field.kind === 'multiselect' || field.kind === 'checkbox') value = matched.join('、')
+      if (!weakConversion) {
+        return { ok: true, value, needsConfirmation: false }
+      }
       return {
         ok: true, value, needsConfirmation: true,
         reason: `「${converted.from}」已按同义值转换为选项「${converted.to}」，请确认`,

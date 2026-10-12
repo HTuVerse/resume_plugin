@@ -161,6 +161,25 @@ describe('mergeIntoKnowledge（知识库合并）', () => {
     expect(result.facts[0].key).toBe('姓名')
     expect(result.facts[0].value).toBe('李四')
   })
+  it('语义相同的日期格式不计更新，低精度值不覆盖完整日期', () => {
+    const existing = [makeFact({ id: 'birthday', key: '出生日期', value: '1971-06-07' })]
+    const same = mergeIntoKnowledge(existing, [makeFact({ key: '生日', value: '1971-6-7' })])
+    expect(same.updated).toBe(0)
+    expect(same.facts[0].value).toBe('1971-06-07')
+    const compatible = mergeIntoKnowledge(existing, [makeFact({ key: '出生年月', value: '1971-6' })])
+    expect(compatible.updated).toBe(0)
+    expect(compatible.facts[0].value).toBe('1971-06-07')
+  })
+  it('复合别名映射到同一槽位后不会重复新增', () => {
+    const existing = [makeFact({ id: 'father', group: '家庭关系', key: '爸爸', value: '张父' })]
+    const result = mergeIntoKnowledge(existing, [
+      makeFact({ group: '家庭关系', key: '父亲姓名', value: '张父' })
+    ])
+    expect(result.added).toBe(0)
+    expect(result.updated).toBe(0)
+    expect(result.facts).toHaveLength(1)
+    expect(result.facts[0].key).toBe('姓名')
+  })
   it('同一槽位的旧别名在折叠时合成一条规范名', () => {
     const folded = foldProfileFacts([
       makeFact({ id: 'name', key: '姓名', value: '张三', updatedAt: '2024-01-01T00:00:00.000Z' }),

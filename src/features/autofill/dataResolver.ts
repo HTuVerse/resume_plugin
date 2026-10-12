@@ -92,6 +92,8 @@ function pickFactsForItem(field: FormField, facts: Fact[], segmentItem?: number 
     if (sameItem.length) return sameItem
     return []
   }
+  // 重复槽位没有可靠段号时必须留空。回退第一段会把同一条经历重复写入多行。
+  if (repeatable) return []
   // 非重复字段：优先 item=1 的数据
   const first = facts.filter(fact => Math.max(1, fact.item || 1) === 1)
   return first.length ? first : facts
@@ -147,6 +149,8 @@ function resolveCustomField(field: FormField, index: FactIndex, segmentItem?: nu
   if (!facts.length) return null
   if (segmentItem === null) return null
   const targetItem = segmentItem || field.item
+  const section = field.sectionId || sectionOfText(field.group)
+  if (nameAlignedSection(section) && !targetItem) return null
   const sameItem = targetItem ? facts.filter(fact => Math.max(1, fact.item || 1) === targetItem) : []
   // 重复段字段不能在同段缺值时退回其它段，否则父亲/母亲、不同经历会互相串写。
   if (targetItem && !sameItem.length) return null
@@ -223,6 +227,9 @@ export function resolveField(field: FormField, index: FactIndex, options: Resolv
       return empty(field, '这一段在知识库中没有对应记录，为避免重复段串写已留空', undefined)
     }
     const targetItem = segmentItem || (alignedSection ? field.item : undefined)
+    if (cited && alignedSection && !targetItem) {
+      return empty(field, '无法确定该字段属于哪一段，为避免重复填写已留空', undefined)
+    }
     const segmentMismatch = Boolean(cited && targetItem && citedItem !== targetItem)
     if (cited && !semanticConflict && !segmentMismatch) {
       // 只要条目或粒度来自二级 AI，就必须遵守 AI 自动填写阈值。

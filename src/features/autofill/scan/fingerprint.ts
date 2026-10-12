@@ -66,7 +66,12 @@ export interface FingerprintInput {
  */
 export function fieldFingerprint(input: FingerprintInput): string {
   const { element, label, kind, repeatIndex, sectionId } = input
-  const name = element.getAttribute('name') || ''
+  const name = element.getAttribute('name')
+    || element.getAttribute('data-form-field-id')
+    || element.getAttribute('data-form-field-name')
+    || element.getAttribute('data-field-id')
+    || element.getAttribute('data-field-name')
+    || ''
   const id = element.id && !isVolatileId(element.id) ? element.id : ''
   const stableAttr = name || id
   const labelNorm = normalize(label)

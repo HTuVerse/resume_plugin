@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { parseResume, testAiConnection } from '../../application/api'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { getAiVisionStatus, parseResume, testAiConnection, testAiVision } from '../../application/api'
 import { downloadBlob, exportFacts, exportProfileTemplate, importFacts, mergeImportedProfileFacts } from '../../infrastructure/transfer/dataTransfer'
 import {
   clearAiSettings, clearAllLocalData, clearCurrentResume, clearProfile, createBackup,
@@ -56,6 +56,12 @@ const busy = ref(false)
 const message = ref('')
 const warning = ref('')
 const aiMessage = ref('')
+const aiTextStatus = ref<'unknown' | 'testing' | 'ready' | 'failed'>('unknown')
+const aiVisionStatus = ref<'unknown' | 'testing' | 'ready' | 'failed'>('unknown')
+watch(() => [aiSettings.url, aiSettings.key, aiSettings.model], () => {
+  if (aiTextStatus.value !== 'testing') aiTextStatus.value = 'unknown'
+  if (aiVisionStatus.value !== 'testing') aiVisionStatus.value = 'unknown'
+})
 const templates = ref<ResumeTemplate[]>([])
 const tableFile = ref<File | null>(null)
 const profileTableFile = ref<File | null>(null)
@@ -175,6 +181,8 @@ onMounted(async () => {
     await saveResumeLibrary(resumes.value)
   }
   Object.assign(aiSettings, await loadAiSettings())
+  const savedVision = await getAiVisionStatus(aiSettings)
+  aiVisionStatus.value = savedVision.status
   templates.value = await loadTemplates()
   const stored = await chrome.storage.local.get('featureSettingsV1')
   if (stored.featureSettingsV1) Object.assign(features, stored.featureSettingsV1)
@@ -273,14 +281,49 @@ async function saveAiConfig() {
 }
 async function verifyAiConfig() {
   if (!aiReady.value) { aiMessage.value = '请先完整填写 AI 配置。'; return }
-  busy.value = true; aiMessage.value = '正在连接模型服务…'
-  try { const reply = await testAiConnection(aiSettings); aiMessage.value = `连接成功：${reply.slice(0, 70)}` }
-  catch (error) { aiMessage.value = error instanceof Error ? error.message : 'AI 接口连接失败。' }
+  busy.value = true; aiTextStatus.value = 'testing'; aiMessage.value = '正在测试文本接口…'
+  try { const reply = await testAiConnection(aiSettings); aiTextStatus.value = 'ready'; aiMessage.value = `文本接口正常：${reply.slice(0, 70)}` }
+  catch (error) { aiTextStatus.value = 'failed'; aiMessage.value = error instanceof Error ? error.message : 'AI 接口连接失败。' }
   finally { busy.value = false }
+}
+function visualTestImage(): { imageUrl: string; token: string } {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const bytes = crypto.getRandomValues(new Uint8Array(6))
+  const token = `HT-${Array.from(bytes, value => alphabet[value % alphabet.length]).join('')}`
+  const canvas = document.createElement('canvas')
+  canvas.width = 440
+  canvas.height = 150
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('浏览器无法生成视觉测试图片。')
+  context.fillStyle = '#f8fafc'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+  context.strokeStyle = '#2563eb'
+  context.lineWidth = 4
+  context.strokeRect(10, 10, canvas.width - 20, canvas.height - 20)
+  context.fillStyle = '#0f172a'
+  context.font = 'bold 44px monospace'
+  context.textAlign = 'center'
+  context.textBaseline = 'middle'
+  context.fillText(token, canvas.width / 2, canvas.height / 2)
+  return { imageUrl: canvas.toDataURL('image/png'), token }
+}
+async function verifyAiVision() {
+  if (!aiReady.value) { aiMessage.value = '请先完整填写 AI 配置。'; return }
+  busy.value = true; aiVisionStatus.value = 'testing'; aiMessage.value = '正在发送内置随机图片测试…'
+  try {
+    const sample = visualTestImage()
+    const reply = await testAiVision(aiSettings, sample.imageUrl, sample.token)
+    aiVisionStatus.value = 'ready'
+    aiMessage.value = `视觉模型正常：${reply}`
+  } catch (error) {
+    aiVisionStatus.value = 'failed'
+    aiMessage.value = error instanceof Error ? error.message : '视觉图片测试失败。'
+  } finally { busy.value = false }
 }
 async function removeAiConfig() {
   if (!confirm('确定删除当前浏览器中保存的 AI 配置吗？')) return
   await clearAiSettings(); Object.assign(aiSettings, { url: 'https://api.openai.com/v1', key: '', model: 'gpt-4o-mini' })
+  aiTextStatus.value = 'unknown'; aiVisionStatus.value = 'unknown'
   aiMessage.value = 'AI 配置已删除。'
 }
 function selectProfileSection(sectionId: string) {
@@ -651,7 +694,21 @@ async function importBackup() {
         <p class="license-meta">编号 {{ license.payload.id }} · {{ licenseExpiryLabel(license.payload) }}</p>
         <div class="setting-actions"><button class="danger-link" type="button" @click="deactivateLicense">清除激活</button></div>
       </section>
-      <section class="content-card settings-card"><div class="card-heading"><div class="title-with-icon"><span class="settings-icon violet">◉</span><div><h2>AI 模型配置</h2><p>配置 AI 模型，用于简历解析和内容生成。</p></div></div><span :class="['connection-pill', aiReady ? 'ready' : '']">● {{ aiReady ? '已配置' : '未配置' }}</span></div><label class="form-row"><span>API Base URL</span><input v-model.trim="aiSettings.url" type="url" placeholder="https://api.openai.com/v1" /></label><label class="form-row"><span>API Key</span><div class="password-input"><input v-model="aiSettings.key" :type="showApiKey ? 'text' : 'password'" placeholder="请输入 API Key" autocomplete="off" /><button type="button" @click="showApiKey = !showApiKey">{{ showApiKey ? '隐藏' : '显示' }}</button></div></label><label class="form-row"><span>模型（Model）</span><input v-model.trim="aiSettings.model" type="text" placeholder="请输入模型名称，例如 gpt-4o-mini" autocomplete="off" /></label><div class="setting-actions"><button class="subtle-button" :disabled="busy || !aiReady" @click="verifyAiConfig">↗ 测试连接</button><button class="primary-button" @click="saveAiConfig">保存配置</button><button class="danger-link" @click="removeAiConfig">删除</button></div><div v-if="aiMessage" class="inline-notice">{{ aiMessage }}</div></section>
+      <section class="content-card settings-card">
+        <div class="card-heading">
+          <div class="title-with-icon"><span class="settings-icon violet">◉</span><div><h2>AI 模型配置</h2><p>文本接口与图片能力分别验证，避免“可以聊天”被误判为“支持视觉”。</p></div></div>
+          <span :class="['connection-pill', aiReady ? 'ready' : '']">● {{ aiReady ? '已配置' : '未配置' }}</span>
+        </div>
+        <label class="form-row"><span>API Base URL</span><input v-model.trim="aiSettings.url" type="url" placeholder="https://api.openai.com/v1" /></label>
+        <label class="form-row"><span>API Key</span><div class="password-input"><input v-model="aiSettings.key" :type="showApiKey ? 'text' : 'password'" placeholder="请输入 API Key" autocomplete="off" /><button type="button" @click="showApiKey = !showApiKey">{{ showApiKey ? '隐藏' : '显示' }}</button></div></label>
+        <label class="form-row"><span>模型（Model）</span><input v-model.trim="aiSettings.model" type="text" placeholder="请输入支持视觉的模型名称，例如 gpt-4o-mini" autocomplete="off" /></label>
+        <div class="capability-status">
+          <span :class="aiTextStatus">文本接口：{{ aiTextStatus === 'ready' ? '已验证' : aiTextStatus === 'failed' ? '失败' : aiTextStatus === 'testing' ? '测试中' : '未验证' }}</span>
+          <span :class="aiVisionStatus">图片能力：{{ aiVisionStatus === 'ready' ? '已验证' : aiVisionStatus === 'failed' ? '不支持或失败' : aiVisionStatus === 'testing' ? '测试中' : '未验证' }}</span>
+        </div>
+        <div class="setting-actions"><button class="subtle-button" :disabled="busy || !aiReady" @click="verifyAiConfig">↗ 测试文本接口</button><button class="subtle-button" :disabled="busy || !aiReady" @click="verifyAiVision">▧ 测试图片能力</button><button class="primary-button" @click="saveAiConfig">保存配置</button><button class="danger-link" @click="removeAiConfig">删除</button></div>
+        <div v-if="aiMessage" class="inline-notice">{{ aiMessage }}</div>
+      </section>
       <section class="content-card settings-card"><div class="card-heading"><div class="title-with-icon"><span class="settings-icon blue">⚙</span><div><h2>功能设置</h2><p>自定义 AI 助手的行为和功能。</p></div></div></div><label class="toggle-row"><span><b>自动高亮填写字段</b><small>在支持的表单上标记已填写字段</small></span><input v-model="features.autoHighlight" type="checkbox" @change="saveFeatureSettings" /></label><label class="toggle-row"><span><b>自动复制到剪贴板</b><small>中心字段填入后保留一份内容用于手动粘贴</small></span><input v-model="features.autoClipboard" type="checkbox" @change="saveFeatureSettings" /></label><label class="toggle-row"><span><b>启用 AI 字段映射</b><small>智能匹配网页字段和你的简历内容</small></span><input v-model="features.aiMapping" type="checkbox" @change="saveFeatureSettings" /></label><label class="threshold-row"><span><b>AI 自动填写匹配阈值</b><small>高于阈值正常高亮；低于阈值使用差异色并等待确认</small></span><div><input v-model.number="features.aiMatchThreshold" type="number" min="0" max="100" step="1" @change="saveFeatureSettings" /><em>%</em></div></label><label class="toggle-row"><span><b>调试模式</b><small>显示详细日志信息，仅用于排查问题</small></span><input v-model="features.debugMode" type="checkbox" @change="saveFeatureSettings" /></label><label class="toggle-row"><span><b>默认显示缩小态</b><small>打开插件时优先显示缩小态悬浮面板</small></span><input v-model="features.miniPanel" type="checkbox" @change="saveFeatureSettings" /></label></section>
       <section class="content-card settings-card">
         <div class="card-heading">
@@ -693,7 +750,7 @@ async function importBackup() {
         </div>
       </section>
       <section class="content-card settings-card"><div class="card-heading"><div class="title-with-icon"><span class="settings-icon cyan">▣</span><div><h2>数据管理</h2><p>管理本地存储的简历和个人信息。</p></div></div></div><div class="data-grid"><div><b>档案表格</b><label class="check-row"><input v-model="redactTable" type="checkbox" /> 导出时脱敏</label><div><button @click="exportTable('xlsx')">导出 Excel</button><button @click="exportTable('csv')">导出 CSV</button></div><label class="file-button">导入表格<input type="file" accept=".xlsx,.xls,.csv" @change="tableFile = ($event.target as HTMLInputElement).files?.[0] || null" /></label><button :disabled="!tableFile || busy" @click="importTable">确认导入</button></div><div><b>完整备份</b><label class="check-row"><input v-model="redactBackup" type="checkbox" /> 脱敏个人字段</label><div><button @click="exportBackup">导出备份</button></div><label class="file-button">选择备份<input type="file" accept=".json" @change="backupFile = ($event.target as HTMLInputElement).files?.[0] || null" /></label><button :disabled="!backupFile || busy" @click="importBackup">恢复备份</button></div></div><div class="danger-zone"><span><b>清除所有数据</b><small>删除当前浏览器中的个人信息、简历、模板和 AI 配置。</small></span><button @click="clearAll">清除所有数据</button></div></section>
-      <section class="privacy-card"><span>◆</span><div><b>隐私说明</b><p>简历和个人信息默认存储在本地设备中，不会自动上传。只有主动使用 AI 功能时，必要文本才会发送到你配置的模型服务。</p></div></section>
+      <section class="privacy-card"><span>◆</span><div><b>隐私说明</b><p>简历和个人信息默认存储在本地设备中。本地 OCR 完全在扩展内运行；只有 DOM 填写失败并触发视觉兜底时，控件附近的裁剪截图和 OCR 候选会发送到你配置的模型服务复核，不会发送完整页面截图。</p></div></section>
     </template>
 
     <footer class="app-footer">

@@ -2,6 +2,7 @@ import { createAiProvider } from '../features/ai/openaiCompatibleProvider'
 import { parseJsonResponse } from '../features/ai/responseParser'
 import type { AiSettings, Fact, FormField, SlotSuggestion } from '../domain/types'
 import { extractResume } from '../features/resume/resumeExtractor'
+import { testVisualImageCapability, visualCapabilityState } from '../features/ai/visualVerifier'
 
 export async function parseResume(file: File, useAi: boolean, config: AiSettings) {
   return extractResume(file, useAi, config)
@@ -28,4 +29,13 @@ export async function testAiConnection(config: AiSettings): Promise<string> {
   const result = parseJsonResponse(reply)
   if (!result.ok || result.value?.ok !== true) throw new Error('模型可以连接，但未按要求返回结构化 JSON。')
   return 'OK（结构化输出正常）'
+}
+
+export async function testAiVision(config: AiSettings, imageUrl: string, expectedText: string): Promise<string> {
+  await testVisualImageCapability(config, imageUrl, expectedText)
+  return '图片输入正常（随机令牌识别通过）'
+}
+
+export async function getAiVisionStatus(config: AiSettings) {
+  return visualCapabilityState(config)
 }

@@ -50,6 +50,11 @@ describe('指纹稳定性', () => {
     const second = fieldFingerprint({ element, label: '学校名称', kind: 'text', repeatIndex: 2 })
     expect(first).not.toBe(second)
   })
+  it('飞书 Formily 的稳定字段属性可跨 DOM 层级保持指纹', () => {
+    const first = fieldFingerprint({ element: render('<form><div data-form-field-id="degree"><input /></div></form>').parentElement!, label: '最高学历', kind: 'combobox' })
+    const second = fieldFingerprint({ element: render('<form><section><div data-form-field-id="degree"><input /></div></section></form>').parentElement!, label: '最高学历', kind: 'combobox' })
+    expect(first).toBe(second)
+  })
 })
 
 describe('structuralPath', () => {

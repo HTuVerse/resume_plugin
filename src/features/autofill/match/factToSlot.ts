@@ -2,6 +2,7 @@ import type { Fact } from '../../../domain/types'
 import type { SectionId } from '../../../domain/slots'
 import { sectionOfText } from '../../ontology/sections'
 import { SLOTS, aliasHit, legacyAliasHit } from '../../ontology/slotRegistry'
+import { inferQualifiedField } from '../../ontology/recordIdentity'
 
 /**
  * 档案侧键名 → 槽位（TECH_DESIGN §5 数据侧）。
@@ -35,7 +36,11 @@ export function factToSlot(fact: Pick<Fact, 'group' | 'key' | 'item'>): FactSlot
   const section = sectionOfText(fact.group)
   const item = Math.max(1, fact.item || 1)
   // 区块内匹配优先；区块未知时只接受全局唯一的别名，同名不猜。
-  const slot = section ? matchInSection(section, fact.key) : matchInSection('', fact.key)
+  const direct = section ? matchInSection(section, fact.key) : matchInSection('', fact.key)
+  const compound = section ? inferQualifiedField({
+    sectionId: section, label: fact.key, placeholder: '', group: fact.group
+  }) : null
+  const slot = direct || compound?.slot
   return { slot, section, item }
 }
 

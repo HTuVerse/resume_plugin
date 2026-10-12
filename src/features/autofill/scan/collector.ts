@@ -1,10 +1,28 @@
 import type { FieldAttrs, FieldKind, FormField } from '../../../domain/types'
-import { CUSTOM_SELECT_SELECTOR, detectFieldKind, getFieldOptions, isDateLikeControl, isSelectLikeControl } from '../fieldDetector'
+import { CUSTOM_SELECT_SELECTOR, detectFieldKind, getFieldOptions, isCustomMultiselect, isDateLikeControl, isSelectLikeControl } from '../fieldDetector'
+import { discoverUniversalControls } from '../control/discovery'
+import { controlOptionCoverage } from '../control/optionCoverage'
+import { sameChoiceGroupElements } from '../control/grouping'
+import { fieldKindFromUniversalType, inferCapabilities, mergeCapabilities, universalTypeFromFieldKind, type UniversalControl, type UniversalOption } from '../control/model'
 import { optionLabel, questionLabel, questionText, resolveLabel, resolveNearbyText } from './labelResolver'
 import { detectRepeatGroup } from './repeatGroups'
 import { fieldFingerprint } from './fingerprint'
 import { sectionOfText } from '../../ontology/sections'
 import { isPlaceholderOption, looksLikeFieldPrompt, plainChoiceText } from '../../ontology/optionMatch'
+import {
+  detectPlatform,
+  PLATFORM_CHECKBOX_GROUP_SELECTOR,
+  PLATFORM_CHOICE_WRAPPER_SELECTOR,
+  PLATFORM_CONTROL_HOST_SELECTOR,
+  PLATFORM_POPUP_SELECTOR,
+  PLATFORM_RADIO_GROUP_SELECTOR,
+  PLATFORM_RANGE_SELECTOR,
+  PLATFORM_SECTION_SELECTOR,
+  PLATFORM_SELECTION_ITEM_SELECTOR,
+  PLATFORM_SEARCH_INPUT_SELECTOR,
+  platformControlHost,
+  platformSectionHeading
+} from '../platforms/registry'
 
 /**
  * 控件收集（§4.1）：从旧 content.scan() 迁出。
@@ -12,7 +30,7 @@ import { isPlaceholderOption, looksLikeFieldPrompt, plainChoiceText } from '../.
  * - 字段 ID 改为稳定指纹（F15），重渲染后可重新定位。
  */
 
-export const FIELD_SELECTOR = 'input,textarea,select,[role="combobox"],[role="textbox"],[role="spinbutton"],[contenteditable="true"]'
+export const FIELD_SELECTOR = 'input,textarea,select,[role="combobox"],[role="textbox"],[role="spinbutton"],[aria-haspopup="listbox"],[aria-haspopup="tree"],[contenteditable="true"]'
 
 export interface FieldRef {
   kind: FieldKind
@@ -21,11 +39,14 @@ export interface FieldRef {
   checkboxes?: HTMLInputElement[]
   /** 不是 input 的选项，例如 role="radio" 的节点。 */
   choices?: HTMLElement[]
+  /** 与 FormField 用 fingerprint 关联的页面内能力模型。 */
+  control?: UniversalControl
 }
 
 export interface ScanOutput {
   fields: FormField[]
   refs: Map<string, FieldRef>
+  controls: Map<string, UniversalControl>
 }
 
 function visible(element: HTMLElement): boolean {
@@ -34,10 +55,11 @@ function visible(element: HTMLElement): boolean {
   return style.visibility !== 'hidden' && style.display !== 'none'
 }
 
-const CHOICE_WRAPPER = 'label,.ant-radio-wrapper,.ant-radio-button-wrapper,.el-radio,.el-radio-button,.arco-radio,.n-radio,.ivu-radio-wrapper,.van-radio,.t-radio,.semi-radio,.ant-checkbox-wrapper,.el-checkbox,[role="radio"],[role="checkbox"]'
-const SPECIFIC_CHOICE_GROUP = '[role="radiogroup"],.ant-radio-group,.el-radio-group,.arco-radio-group,.n-radio-group,.ivu-radio-group,.van-radio-group,.t-radio-group,.semi-radio-group,.ant-checkbox-group,.el-checkbox-group'
-const CUSTOM_RADIO_GROUP = '[role="radiogroup"],.ant-radio-group,.el-radio-group,.arco-radio-group,.n-radio-group,.ivu-radio-group,.van-radio-group,.t-radio-group,.semi-radio-group'
-const CHOICE_MENU = `${CUSTOM_SELECT_SELECTOR},[role="listbox"],.ant-select-dropdown,.el-select-dropdown,.arco-select-dropdown,.semi-select-dropdown,.t-select__dropdown,[class*="select-dropdown"]`
+const CHOICE_WRAPPER = ['label,.ant-radio-wrapper,.ant-radio-button-wrapper,.el-radio,.el-radio-button,.arco-radio,.n-radio,.ivu-radio-wrapper,.van-radio,.t-radio,.semi-radio,.ant-checkbox-wrapper,.el-checkbox,[role="radio"],[role="checkbox"],[role="switch"],[aria-pressed]', PLATFORM_CHOICE_WRAPPER_SELECTOR].filter(Boolean).join(',')
+const SPECIFIC_CHOICE_GROUP = ['[role="radiogroup"],.ant-radio-group,.el-radio-group,.arco-radio-group,.n-radio-group,.ivu-radio-group,.van-radio-group,.t-radio-group,.semi-radio-group,.ant-checkbox-group,.el-checkbox-group', PLATFORM_RADIO_GROUP_SELECTOR, PLATFORM_CHECKBOX_GROUP_SELECTOR].filter(Boolean).join(',')
+const CUSTOM_RADIO_GROUP = ['[role="radiogroup"],.ant-radio-group,.el-radio-group,.arco-radio-group,.n-radio-group,.ivu-radio-group,.van-radio-group,.t-radio-group,.semi-radio-group', PLATFORM_RADIO_GROUP_SELECTOR].filter(Boolean).join(',')
+const CUSTOM_CHECKBOX_GROUP = ['[role="group"],[aria-multiselectable="true"],.ant-checkbox-group,.el-checkbox-group,.arco-checkbox-group,.n-checkbox-group,.ivu-checkbox-group,.t-checkbox-group,.semi-checkbox-group', PLATFORM_CHECKBOX_GROUP_SELECTOR].filter(Boolean).join(',')
+const CHOICE_MENU = [CUSTOM_SELECT_SELECTOR, '[role="listbox"],.ant-select-dropdown,.el-select-dropdown,.arco-select-dropdown,.semi-select-dropdown,.t-select__dropdown,[class*="select-dropdown"]', PLATFORM_POPUP_SELECTOR].filter(Boolean).join(',')
 
 /**
  * 组件库常把 radio / checkbox / select 的原生节点藏起来（display:none 或 0 尺寸），
@@ -57,13 +79,7 @@ function present(element: HTMLElement): boolean {
 }
 
 function sameChoiceGroup(a: HTMLInputElement, b: HTMLInputElement): boolean {
-  if (a.type !== b.type) return false
-  const groupA = a.closest(SPECIFIC_CHOICE_GROUP)
-  const groupB = b.closest(SPECIFIC_CHOICE_GROUP)
-  if (groupA || groupB) return groupA === groupB
-  if (a.name && a.name === b.name && a.form === b.form) return true
-  if (a.name || b.name) return false
-  return a.parentElement != null && a.parentElement === b.parentElement
+  return sameChoiceGroupElements(a, b)
 }
 
 function classText(element: HTMLElement): string {
@@ -72,7 +88,7 @@ function classText(element: HTMLElement): string {
 
 /** 选中样式。strict 时不把单独的 active 算进去，避免误伤图标。 */
 function markedSelected(element: HTMLElement, strict = false): boolean {
-  if (element.getAttribute('aria-checked') === 'true' || element.getAttribute('aria-selected') === 'true') return true
+  if (element.getAttribute('aria-checked') === 'true' || element.getAttribute('aria-selected') === 'true' || element.getAttribute('aria-pressed') === 'true') return true
   const className = classText(element)
   if (/(?:^|\s)(?:is-checked|is-active|checked|selected)(?:\s|$)/.test(className)) return true
   if (/(?:^|[\s_])[\w-]*is-checked(?:[\s_]|$)/.test(className)) return true
@@ -236,13 +252,13 @@ function markedOptionText(ref: FieldRef, nodes: HTMLElement[]): string {
 
 function choiceSelected(element: HTMLElement): boolean {
   if (element instanceof HTMLInputElement && element.checked) return true
-  if (element.getAttribute('aria-checked') === 'true') return true
+  if (element.getAttribute('aria-checked') === 'true' || element.getAttribute('aria-pressed') === 'true') return true
   return visuallySelected(element)
 }
 
 /** 组件库下拉框展示的是选中项文字。打开时搜索框里的半截输入不能当成已选值。 */
-const SELECTION_ITEM = '.ant-select-selection-item,.ant-select-selection-selected-value,.el-select__selected-item,.el-select__tags-text,.arco-select-view-value,.n-base-selection-label,.ivu-select-selected-value,.semi-select-selection-text,.t-tag,.t-select__single'
-const SEARCH_INPUT = '.ant-select-selection-search-input,.ant-select-search__field,.el-select__input'
+const SELECTION_ITEM = ['.ant-select-selection-item,.ant-select-selection-selected-value,.el-select__selected-item,.el-select__tags-text,.arco-select-view-value,.n-base-selection-label,.ivu-select-selected-value,.semi-select-selection-text,.t-tag,.t-select__single', PLATFORM_SELECTION_ITEM_SELECTOR].filter(Boolean).join(',')
+const SEARCH_INPUT = ['.ant-select-selection-search-input,.ant-select-search__field,.el-select__input', PLATFORM_SEARCH_INPUT_SELECTOR].filter(Boolean).join(',')
 
 function isSearchInput(input: HTMLInputElement): boolean {
   return input.matches(SEARCH_INPUT) || input.getAttribute('aria-autocomplete') === 'list'
@@ -258,11 +274,13 @@ function committedText(node: HTMLElement, placeholder = ''): string {
 }
 
 function displayedSelection(element: HTMLElement): string {
-  const host = element.closest(CUSTOM_SELECT_SELECTOR) || element
+  const matchedHost = platformControlHost(element) || element.closest(CUSTOM_SELECT_SELECTOR)
+  const host = matchedHost instanceof HTMLElement ? matchedHost : element
   const input = host instanceof HTMLInputElement ? host : host.querySelector<HTMLInputElement>('input:not([type="hidden"])')
   const placeholder = (input?.getAttribute('placeholder') || host.getAttribute('placeholder') || '').trim()
-  const shown = Array.from(host.querySelectorAll<HTMLElement>(SELECTION_ITEM)).map(node => committedText(node, placeholder)).find(Boolean) || ''
-  if (shown) return shown
+  const shown = [...new Set(Array.from(host.querySelectorAll<HTMLElement>(SELECTION_ITEM))
+    .map(node => committedText(node, placeholder)).filter(Boolean))]
+  if (shown.length) return isCustomMultiselect(host) ? shown.join('、') : shown[0]
   if (!input || isSearchInput(input)) return ''
   const value = input.value.trim()
   if (!value || value === placeholder || value.length > 40 || looksLikeFieldPrompt(value)) return ''
@@ -291,18 +309,10 @@ function controlLabel(element: HTMLElement, kind: FieldKind): ReturnType<typeof 
 
 /** 递归收集候选控件，穿透 open shadow root。 */
 export function collectCandidates(root: ParentNode): HTMLElement[] {
-  const out: HTMLElement[] = []
-  const walk = (scope: ParentNode) => {
-    for (const element of Array.from(scope.querySelectorAll<HTMLElement>(FIELD_SELECTOR))) out.push(element)
-    for (const host of Array.from(scope.querySelectorAll<HTMLElement>('*'))) {
-      if (host.shadowRoot) walk(host.shadowRoot)
-    }
-  }
-  walk(root)
-  return out
+  return discoverUniversalControls(root).map(discovery => discovery.element)
 }
 
-const SECTION_HEADING = ':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6,:scope > legend,:scope > [role="heading"],:scope > .ant-card-head,:scope > .el-card__header,:scope > [class*="title"],:scope > [class*="header"]'
+const SECTION_HEADING = [':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6,:scope > legend,:scope > [role="heading"],:scope > .ant-card-head,:scope > .el-card__header,:scope > [class*="title"],:scope > [class*="header"]', PLATFORM_SECTION_SELECTOR].filter(Boolean).join(',')
 
 function compactText(element: HTMLElement): string {
   return (element.textContent || '').replace(/\s+/g, ' ').trim()
@@ -321,6 +331,8 @@ function titleOnlyText(element: HTMLElement): string {
  * 网申页常把「教育经历」放在表单块前面，不包在 fieldset / card 里。
  */
 export function sectionHeadingOf(element: HTMLElement): string {
+  const platformHeading = platformSectionHeading(element)
+  if (platformHeading && sectionOfText(platformHeading)) return platformHeading
   let node: HTMLElement | null = element.parentElement
   for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
     let sibling: Element | null = node.previousElementSibling
@@ -375,9 +387,10 @@ function currentValue(ref: FieldRef): string {
     return fromNode
   }
   if (kind === 'checkbox') {
-    const checkboxes = ref.checkboxes || [element as HTMLInputElement]
-    if (checkboxes.length === 1 && !ref.choices?.length) return checkboxes[0].checked ? '是' : ''
-    return checkboxes.filter(checkbox => checkbox.checked).map(checkbox => optionLabel(checkbox) || checkbox.value).join('、')
+    const nodes: HTMLElement[] = [...(ref.checkboxes || []), ...(ref.choices || [])]
+    if (!nodes.length) nodes.push(element)
+    if (nodes.length === 1) return choiceSelected(nodes[0]) ? '是' : ''
+    return nodes.filter(choiceSelected).map(node => optionLabel(node) || (node instanceof HTMLInputElement ? node.value : '')).filter(Boolean).join('、')
   }
   if (element instanceof HTMLSelectElement) {
     // 不用 selectedOptions：其 live 集合在部分环境（含 jsdom）对 selectedIndex 变更不失效
@@ -387,7 +400,7 @@ function currentValue(ref: FieldRef): string {
       .filter(option => option && !isPlaceholderOption(option) && !looksLikeFieldPrompt(option))
     return selected.join('、')
   }
-  if (kind === 'combobox' || kind === 'cascade') return displayedSelection(element)
+  if (kind === 'combobox' || kind === 'cascade' || kind === 'multiselect') return displayedSelection(element)
   if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
     const value = element.value.trim()
     const placeholder = element.placeholder.trim()
@@ -415,7 +428,12 @@ function attrsOf(element: HTMLElement): FieldAttrs {
  */
 export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
   const refs = new Map<string, FieldRef>()
+  const controls = new Map<string, UniversalControl>()
   const fields: FormField[] = []
+  const discoveries = discoverUniversalControls(root)
+  const platform = detectPlatform(root)
+  const discoveryByElement = new Map(discoveries.map(discovery => [discovery.element, discovery]))
+  const candidates = discoveries.map(discovery => discovery.element)
   const radiosSeen = new Set<string>()
   const checkboxesSeen = new Set<string>()
   const selectHosts = new Set<HTMLElement>()
@@ -443,11 +461,50 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
     let fingerprint = fieldFingerprint({ element, label: labelText, kind, repeatIndex: repeat?.item, sectionId })
     while (usedIds.has(fingerprint)) fingerprint = `${fingerprint}+`
     usedIds.add(fingerprint)
+    const controlType = universalTypeFromFieldKind(kind, options.length)
+    const discovery = discoveryByElement.get(element)
+    const optionElements: HTMLElement[] = extras.choices
+      || extras.radios
+      || extras.checkboxes
+      || (element instanceof HTMLSelectElement ? Array.from(element.options) : [])
+    const universalOptions: UniversalOption[] = optionElements.map((option, index) => ({
+      id: option.id || `option-${index + 1}`,
+      label: optionLabel(option),
+      value: option.getAttribute('value') || option.getAttribute('data-value') || undefined,
+      disabled: option.hasAttribute('disabled') || option.getAttribute('aria-disabled') === 'true',
+      selected: option instanceof HTMLOptionElement
+        ? option.selected
+        : option instanceof HTMLInputElement
+          ? option.checked
+          : markedSelected(option),
+      element: option
+    })).filter(option => option.label)
+    const control: UniversalControl = {
+      fingerprint,
+      type: controlType,
+      element,
+      platformId: platform?.adapter.id,
+      platformVersion: platform?.adapter.version,
+      label: labelText,
+      labelSource: resolved.source,
+      currentValue: currentValue(ref),
+      options: universalOptions,
+      optionCoverage: controlOptionCoverage(controlType, element, options.length),
+      capabilities: mergeCapabilities(inferCapabilities(element, controlType), discovery?.capabilities),
+      sectionId,
+      repeatIndex: repeat?.item,
+      confidence: discovery?.confidence ?? 0.72,
+      evidence: [...(discovery?.evidence || []), `classifier:${kind}`]
+    }
+    ref.control = control
     refs.set(fingerprint, ref)
+    controls.set(fingerprint, control)
     const placeholderHost = element.matches('input,textarea') ? element : element.querySelector('input[placeholder],textarea[placeholder]')
     fields.push({
       id: fingerprint,
       fingerprint,
+      platformId: platform?.adapter.id,
+      platformVersion: platform?.adapter.version,
       label: labelText,
       labelSource: resolved.source,
       group,
@@ -455,10 +512,11 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
       placeholder: placeholderHost?.getAttribute('placeholder')?.trim() || '',
       kind,
       options,
-      current: currentValue(ref),
+      optionCoverage: control.optionCoverage,
+      current: control.currentValue,
       required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
       maxLength: element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? Math.max(0, element.maxLength) : 0,
-      range: Boolean(element.closest('.ant-picker-range,.el-range-editor,.el-date-editor--daterange,.el-date-editor--monthrange')),
+      range: Boolean(element.closest(['.ant-picker-range,.el-range-editor,.el-date-editor--daterange,.el-date-editor--monthrange', PLATFORM_RANGE_SELECTOR].filter(Boolean).join(','))),
       name: element.getAttribute('name') || undefined,
       item: repeat?.item,
       repeatGroupId: repeat?.repeatGroupId,
@@ -467,9 +525,12 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
     })
   }
 
-  for (const element of collectCandidates(root)) {
+  for (const element of candidates) {
     if (element.closest('[data-resume-assistant]')) continue
-    const selectHost = element.closest(CUSTOM_SELECT_SELECTOR) as HTMLElement | null
+    // 选项节点由后面的通用分组器合并，避免每个选项被当成独立字段。
+    if (element.matches('[role="radio"],[role="checkbox"],[role="switch"],[aria-pressed],[role="radiogroup"]')) continue
+    const selectHost = platformControlHost(element)
+      || element.closest([CUSTOM_SELECT_SELECTOR, PLATFORM_CONTROL_HOST_SELECTOR].filter(Boolean).join(',')) as HTMLElement | null
     if (selectHost) {
       if (selectHosts.has(selectHost) || !visible(selectHost)) continue
       selectHosts.add(selectHost)
@@ -493,7 +554,11 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
 
     const resolved = resolveLabel(element)
     const group = groupOf(element)
-    const kind = detectFieldKind(element, resolved.text, group)
+    let kind = detectFieldKind(element, resolved.text, group)
+    const discoveredType = discoveryByElement.get(element)?.type
+    if (kind === 'text' && discoveredType && discoveredType !== 'text' && discoveredType !== 'unknown') {
+      kind = fieldKindFromUniversalType(discoveredType)
+    }
 
     let radios: HTMLInputElement[] | undefined
     let checkboxes: HTMLInputElement[] | undefined
@@ -506,7 +571,7 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
           : `parent:${element.parentElement ? groupKey(element.parentElement) : groupKey(element)}`
       if (radiosSeen.has(key)) continue
       radiosSeen.add(key)
-      radios = collectCandidates(root)
+      radios = candidates
         .filter((el): el is HTMLInputElement => el instanceof HTMLInputElement && el.type === 'radio')
         .filter(radio => present(radio) && sameChoiceGroup(radio, element))
     }
@@ -519,7 +584,7 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
           : `parent:${element.parentElement ? groupKey(element.parentElement) : groupKey(element)}`
       if (checkboxesSeen.has(key)) continue
       checkboxesSeen.add(key)
-      checkboxes = collectCandidates(root)
+      checkboxes = candidates
         .filter((el): el is HTMLInputElement => el instanceof HTMLInputElement && el.type === 'checkbox')
         .filter(checkbox => present(checkbox) && sameChoiceGroup(checkbox, element))
     }
@@ -528,8 +593,89 @@ export function scanPage(root: Document | ShadowRoot = document): ScanOutput {
   }
 
   collectCustomRadios(root, addField)
+  collectCustomCheckboxes(root, addField)
 
-  return { fields, refs }
+  // 最近共同容器中的多个选择控件形成结构簇。这里只记录页面结构，
+  // 不读取字段名称；语义层只有在簇内恰好存在一个知识绑定时才会继承。
+  const projectable = fields.filter(field => ['select', 'combobox', 'cascade'].includes(field.kind))
+  const elementOf = (field: FormField) => refs.get(field.fingerprint)?.element
+  const clustered = new Set<string>()
+  for (const field of projectable) {
+    if (clustered.has(field.id)) continue
+    let ancestor = elementOf(field)?.parentElement || null
+    for (let depth = 0; ancestor && depth < 5 && ancestor !== document.body; depth += 1, ancestor = ancestor.parentElement) {
+      const members = projectable.filter(candidate => {
+        const element = elementOf(candidate)
+        return Boolean(element && ancestor?.contains(element))
+      })
+      if (members.length < 2) continue
+      if (members.length > 6) break
+      const groupId = `cluster:${members.map(member => member.fingerprint).sort().join('|')}`
+      for (const member of members) {
+        member.controlClusterId = groupId
+        clustered.add(member.id)
+      }
+      break
+    }
+  }
+
+  return { fields, refs, controls }
+}
+
+/** 无原生 input 的 checkbox/switch。组内多项按多选处理，孤立项按布尔值处理。 */
+function collectCustomCheckboxes(root: ParentNode, addField: (element: HTMLElement, kind: 'checkbox', extras: { choices: HTMLElement[] }) => void): void {
+  const claimed = new Set<HTMLElement>()
+  const claim = (choices: HTMLElement[]) => choices.forEach(choice => claimed.add(choice))
+  forEachScope(root, scope => {
+    const groups = Array.from(scope.querySelectorAll<HTMLElement>(CUSTOM_CHECKBOX_GROUP))
+    // 外层表单也可能使用 role=group；只把最内层选项容器当作一个问题组。
+    const innermost = groups.filter(group => !groups.some(other => other !== group && group.contains(other)))
+    for (const group of innermost) {
+      if (!visible(group) || group.querySelector('input[type="checkbox"]')) continue
+      const choices = labeledChoices(Array.from(group.querySelectorAll<HTMLElement>('[role="checkbox"],[role="switch"],[aria-pressed]'))
+        .filter(choice => visible(choice) && !claimed.has(choice) && !choice.closest('[role="radiogroup"]')))
+      if (choices.length < 2) continue
+      claim(choices)
+      addField(group, 'checkbox', { choices })
+    }
+    const pressedByParent = new Map<HTMLElement, HTMLElement[]>()
+    for (const choice of Array.from(scope.querySelectorAll<HTMLElement>('[aria-pressed]'))) {
+      if (!visible(choice) || claimed.has(choice) || choice.closest('[role="radiogroup"]')) continue
+      const parent = choice.parentElement
+      if (!parent || !visible(parent)) continue
+      const siblings = pressedByParent.get(parent) || []
+      siblings.push(choice)
+      pressedByParent.set(parent, siblings)
+    }
+    for (const [parent, grouped] of pressedByParent) {
+      const choices = labeledChoices(grouped.filter(choice => !claimed.has(choice)))
+      if (choices.length < 2) continue
+      claim(choices)
+      addField(parent, 'checkbox', { choices })
+    }
+    const classedByParent = new Map<HTMLElement, HTMLElement[]>()
+    for (const choice of Array.from(scope.querySelectorAll<HTMLElement>('[class*="checkbox"]'))) {
+      if (!visible(choice) || claimed.has(choice) || !isCustomChoiceOption(choice) || !/checkbox/i.test(classTextOf(choice))) continue
+      if (choice.querySelector('input,select,textarea,[role="radio"],[role="checkbox"]')) continue
+      const parent = choice.parentElement
+      if (!parent || !visible(parent)) continue
+      const siblings = classedByParent.get(parent) || []
+      siblings.push(choice)
+      classedByParent.set(parent, siblings)
+    }
+    for (const [parent, grouped] of classedByParent) {
+      const leaves = grouped.filter(choice => !grouped.some(other => other !== choice && choice.contains(other)))
+      const choices = labeledChoices(leaves.filter(choice => !claimed.has(choice)))
+      if (choices.length < 2) continue
+      claim(choices)
+      addField(parent, 'checkbox', { choices })
+    }
+    for (const choice of Array.from(scope.querySelectorAll<HTMLElement>('[role="checkbox"],[role="switch"],[aria-pressed]'))) {
+      if (!visible(choice) || claimed.has(choice) || choice.closest('[role="radiogroup"]') || choice.querySelector('input[type="checkbox"]')) continue
+      claim([choice])
+      addField(choice, 'checkbox', { choices: [choice] })
+    }
+  })
 }
 
 function forEachScope(root: ParentNode, visit: (scope: ParentNode) => void): void {
@@ -571,14 +717,14 @@ function collectCustomRadios(root: ParentNode, addField: (element: HTMLElement, 
   forEachScope(root, scope => {
     for (const group of Array.from(scope.querySelectorAll<HTMLElement>(CUSTOM_RADIO_GROUP))) {
       if (!visible(group) || group.querySelector('input[type="radio"]')) continue
-      const choices = labeledChoices(Array.from(group.querySelectorAll<HTMLElement>('[role="radio"]')).filter(choice => visible(choice) && !taken(choice)))
+      const choices = labeledChoices(Array.from(group.querySelectorAll<HTMLElement>('[role="radio"],[aria-pressed]')).filter(choice => visible(choice) && !taken(choice)))
       if (choices.length < 2) continue
       claim(choices)
       addField(group, 'radio', { choices })
     }
 
     const byParent = new Map<HTMLElement, HTMLElement[]>()
-    for (const choice of Array.from(scope.querySelectorAll<HTMLElement>('[role="radio"]'))) {
+    for (const choice of Array.from(scope.querySelectorAll<HTMLElement>('[role="radio"],[role="radiogroup"] [aria-pressed]'))) {
       if (!visible(choice) || taken(choice) || choice.querySelector('input[type="radio"]')) continue
       const parent = choice.parentElement
       if (!parent || !visible(parent) || parent.querySelector('input[type="radio"]')) continue
@@ -596,6 +742,7 @@ function collectCustomRadios(root: ParentNode, addField: (element: HTMLElement, 
     const classed = new Map<HTMLElement, HTMLElement[]>()
     for (const choice of Array.from(scope.querySelectorAll<HTMLElement>('[class*="radio"],[class*="option"],[class*="opt"]'))) {
       if (!visible(choice) || taken(choice) || !isCustomChoiceOption(choice)) continue
+      if (/checkbox/i.test(classTextOf(choice))) continue
       if (choice.querySelector('input,select,textarea,[role="radio"],[role="checkbox"]')) continue
       const parent = choice.parentElement
       if (!parent || !visible(parent) || parent.querySelector('input[type="radio"]')) continue

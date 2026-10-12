@@ -146,6 +146,12 @@ export async function recordFailure(ruleId: string): Promise<void> {
   const rule = rules.find(item => item.id === ruleId)
   if (!rule) return
   rule.failCount += 1
+  // 连续表现不稳定时先取消“同站同标签泛化”，仅保留精确指纹规则；
+  // 精确指纹继续失败才整条停用，避免一次网络抖动就删掉用户确认结果。
+  if (rule.failCount >= 2 && rule.failCount > rule.hitCount) {
+    delete rule.labelKey
+    delete rule.sectionId
+  }
   if (rule.failCount >= 3 && rule.failCount > rule.hitCount) rule.disabled = true
   rule.updatedAt = new Date().toISOString()
   await saveSiteRules(rules)

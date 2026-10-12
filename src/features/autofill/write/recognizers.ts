@@ -1,12 +1,16 @@
-import type { FillReasonCode } from '../../../domain/types'
+import type { FillReasonCode, FillRequest } from '../../../domain/types'
 import type { FieldRef } from '../scan/collector'
 import { readCurrentValue } from '../scan/collector'
 import { isPlaceholderOption, matchOption, plainChoiceText } from '../../ontology/optionMatch'
 import { booleanValue } from '../../ontology/synonyms'
 import { isOngoingDate, normalizeDateValue, splitOngoingRange } from '../../ontology/validators'
 import { optionLabel } from '../scan/labelResolver'
-import { dispatchFieldEvents, pollUntil, setNativeChecked, setNativeSelect, setNativeText, wait } from './domUtils'
+import { dispatchFieldEvents, isElementVisible, pollUntil, setNativeChecked, setNativeSelect, setNativeText, wait } from './domUtils'
 import { popupOptions, visiblePopupFor, watchForPopup } from './popupLocator'
+import { trustedClickElement, trustedReplaceText, trustedScrollElement } from './trustedInput'
+import type { ControlCapabilities } from '../control/model'
+import { projectOptionFromValue } from '../valueProjection'
+import { PLATFORM_CONTROL_HOST_SELECTOR, PLATFORM_DATE_SELECTOR, PLATFORM_RANGE_SELECTOR, PLATFORM_SEARCH_INPUT_SELECTOR, PLATFORM_SELECTION_ITEM_SELECTOR } from '../platforms/registry'
 
 /** 按通用分隔符拆开多级值。连写的行政区名称再按后缀切一刀，这只用于拆字。 */
 export function splitCascadeValue(value: string): string[] {
@@ -45,51 +49,79 @@ function pickOption(nodes: HTMLElement[], value: string): OptionPick {
  * 点中一级之后，只有可见选项的文字变了才点下一级。
  * 同一列表被换掉，或多出一批新选项，都算下一级。不看组件库的列名。
  */
-async function stepThroughOptions(scope: HTMLElement, value: string, input: HTMLInputElement | null): Promise<WriteAttempt> {
+async function stepThroughOptions(
+  scope: HTMLElement,
+  value: string,
+  input: HTMLInputElement | null,
+  trusted = false,
+  allowSearch = true,
+  projectWholeValue = false
+): Promise<WriteAttempt> {
   const levels = splitCascadeValue(value)
   let host = scope
   const nodesNow = () => realOptions(popupOptions(host.isConnected ? host : document.body))
   const full = pickOption(nodesNow(), value)
   if (full.status === 'ambiguous') return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
   if (full.status === 'found') {
-    clickElement(full.node)
+    await activateElement(full.node, trusted)
     await wait(120)
     return { applied: true }
   }
-  if (levels.length <= 1) return { applied: false, reasonCode: 'no-matching-option' }
+  if (levels.length <= 1 && !projectWholeValue) return { applied: false, reasonCode: 'no-matching-option' }
 
   let previousTexts: string[] = []
-  for (let level = 0; level < levels.length; level += 1) {
+  const selectedTexts: string[] = []
+  const levelCount = levels.length > 1 ? levels.length : 8
+  for (let level = 0; level < levelCount; level += 1) {
     const poolFor = () => {
       const pool = nodesNow()
       if (!level || !previousTexts.length) return pool
       const fresh = pool.filter(node => !previousTexts.includes(optionText(node)))
       return fresh.length ? fresh : pool
     }
-    let picked = pickOption(poolFor(), levels[level])
-    if (picked.status === 'missing' && input && !input.readOnly) {
-      setNativeText(input, levels[level])
+    const pool = poolFor()
+    const target = levels.length > 1 ? levels[level] : value
+    let picked = pickOption(pool, target)
+    if (picked.status === 'missing' && projectWholeValue) {
+      const projected = projectOptionFromValue(pool.map(optionText), value, selectedTexts)
+      if (projected?.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '当前层存在多个可投影选项' }
+      if (projected && pool[projected.index]) picked = { status: 'found', node: pool[projected.index] }
+    }
+    if (picked.status === 'missing' && allowSearch && input && !input.readOnly) {
+      if (!trusted || !await trustedReplaceText(input, target)) setNativeText(input, target)
       await wait(320)
-      picked = pickOption(poolFor(), levels[level])
+      const searchedPool = poolFor()
+      picked = pickOption(searchedPool, target)
+      if (picked.status === 'missing' && projectWholeValue) {
+        const projected = projectOptionFromValue(searchedPool.map(optionText), value, selectedTexts)
+        if (projected?.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '当前层存在多个可投影选项' }
+        if (projected && searchedPool[projected.index]) picked = { status: 'found', node: searchedPool[projected.index] }
+      }
     }
     if (picked.status === 'ambiguous') return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
     if (picked.status !== 'found') {
-      return { applied: false, reasonCode: 'no-matching-option', detail: `第 ${level + 1} 级找不到「${levels[level]}」` }
+      return { applied: false, reasonCode: 'no-matching-option', detail: `第 ${level + 1} 级找不到唯一匹配` }
     }
     previousTexts = nodesNow().map(optionText)
-    clickElement(picked.node)
-    if (level === levels.length - 1) {
+    selectedTexts.push(optionText(picked.node))
+    await activateElement(picked.node, trusted)
+    if (levels.length > 1 && level === levels.length - 1) {
       await wait(120)
       return { applied: true }
     }
-    const nextHost = await pollUntil(() => {
+    const transition = await pollUntil<{ status: 'next'; host: HTMLElement } | { status: 'done' } | null>(() => {
+      if (!host.isConnected || !isElementVisible(host)) return { status: 'done' }
       const current = host.isConnected ? host : document.body
       const texts = realOptions(popupOptions(current)).map(optionText)
       if (!texts.length || texts.join('\n') === previousTexts.join('\n')) return null
-      return current
+      return { status: 'next', host: current }
     }, 1500)
-    if (!nextHost) return { applied: false, reasonCode: 'option-list-not-found', detail: '下一级未出现' }
-    host = nextHost
+    if (transition?.status === 'done' && projectWholeValue) return { applied: true }
+    if (!transition) {
+      return { applied: false, reasonCode: 'option-list-not-found', detail: '下一级未出现' }
+    }
+    if (transition.status === 'done') return { applied: false, reasonCode: 'option-list-not-found', detail: '下一级未出现' }
+    host = transition.host
   }
   return { applied: true }
 }
@@ -103,6 +135,7 @@ async function stepThroughOptions(scope: HTMLElement, value: string, input: HTML
 
 export interface ControlContext {
   ref: FieldRef
+  request?: FillRequest
 }
 
 export interface WriteAttempt {
@@ -119,6 +152,8 @@ export interface ControlRecognizer {
   match(ref: FieldRef): boolean
   read(ctx: ControlContext): string
   write(ctx: ControlContext, value: string): Promise<WriteAttempt>
+  /** 普通 DOM 事件被页面拒绝时，通过浏览器协议重试一次。 */
+  trustedWrite?(ctx: ControlContext, value: string): Promise<WriteAttempt>
   /** 撤销（F52）。返回 false 表示无法恢复，由调用方明确列出。 */
   restore?(ctx: ControlContext, previous: string): Promise<boolean>
   settleTimeoutMs?: number
@@ -182,6 +217,11 @@ function clickElement(element: HTMLElement): void {
   element.click()
 }
 
+async function activateElement(element: HTMLElement, trusted = false): Promise<void> {
+  if (trusted && await trustedClickElement(element)) return
+  clickElement(element)
+}
+
 function splitMulti(value: string): string[] {
   return value.split(/[,，、|/]/).map(item => item.trim()).filter(Boolean)
 }
@@ -201,6 +241,9 @@ const textRecognizer: ControlRecognizer = {
     }
     if (writeRichText(element, value)) return { applied: true }
     return { applied: false, reasonCode: 'unsupported-control' }
+  },
+  async trustedWrite(ctx, value) {
+    return { applied: await trustedReplaceText(ctx.ref.element, value), reasonCode: 'trusted-input-failed' }
   },
   async restore(ctx, previous) {
     const result = await this.write(ctx, previous)
@@ -390,30 +433,44 @@ const choiceRecognizer: ControlRecognizer = {
       const target = nodes[match.index]
       if (target instanceof HTMLInputElement) return { applied: activateRadio(target) }
       clickElement(target)
-      target.setAttribute('aria-checked', 'true')
+      target.setAttribute(target.hasAttribute('aria-pressed') ? 'aria-pressed' : 'aria-checked', 'true')
       for (const other of nodes) {
-        if (other !== target) other.setAttribute('aria-checked', 'false')
+        if (other !== target) other.setAttribute(other.hasAttribute('aria-pressed') ? 'aria-pressed' : 'aria-checked', 'false')
       }
       return { applied: true }
     }
-    const checkboxes = ref.checkboxes || [ref.element as HTMLInputElement]
+    const checkboxes: HTMLElement[] = [...(ref.checkboxes || []), ...(ref.choices || [])]
+    if (!checkboxes.length) checkboxes.push(ref.element)
+    const checked = (node: HTMLElement) => node instanceof HTMLInputElement
+      ? node.checked
+      : node.getAttribute('aria-checked') === 'true' || node.getAttribute('aria-selected') === 'true' || node.getAttribute('aria-pressed') === 'true'
+    const toggle = (node: HTMLElement, target: boolean) => {
+      if (checked(node) === target) return true
+      if (node instanceof HTMLInputElement) {
+        node.click()
+        if (node.checked !== target) setNativeChecked(node, target)
+      } else {
+        clickElement(node)
+      }
+      return checked(node) === target
+    }
     if (checkboxes.length === 1) {
       const target = booleanValue(value)
       if (target === null) return { applied: false, reasonCode: 'no-matching-option' }
       const checkbox = checkboxes[0]
-      if (checkbox.checked !== target) checkbox.click()
-      dispatchFieldEvents(checkbox)
-      return { applied: checkbox.checked === target }
+      const applied = toggle(checkbox, target)
+      if (checkbox instanceof HTMLInputElement) dispatchFieldEvents(checkbox)
+      return { applied }
     }
     const requested = splitMulti(value)
     if (!requested.length) return { applied: false, reasonCode: 'no-matching-option' }
     for (const checkbox of checkboxes) {
-      const label = optionLabel(checkbox) || checkbox.value
+      const label = optionLabel(checkbox) || (checkbox instanceof HTMLInputElement ? checkbox.value : '')
       const target = requested.some(item => matchOption([label], item).index === 0)
-      if (checkbox.checked !== target) checkbox.click()
-      dispatchFieldEvents(checkbox)
+      if (!toggle(checkbox, target)) return { applied: false, reasonCode: 'timeout', detail: `选项「${label || '未命名'}」未响应点击` }
+      if (checkbox instanceof HTMLInputElement) dispatchFieldEvents(checkbox)
     }
-    return { applied: checkboxes.some(checkbox => checkbox.checked) }
+    return { applied: requested.every(item => checkboxes.some(node => checked(node) && matchOption([optionLabel(node) || (node instanceof HTMLInputElement ? node.value : '')], item).index === 0)) }
   }
 }
 
@@ -425,10 +482,10 @@ function innerInput(element: HTMLElement): HTMLInputElement | null {
 }
 
 const MONTH_NAMES = ['一月', '二月', '三月', '四月', '五月', '六月', '七月', '八月', '九月', '十月', '十一月', '十二月']
-const PREV_YEAR = '.ant-picker-header-super-prev-btn,.el-picker-panel__icon-btn.d-arrow-left,.el-date-picker__prev-btn.el-icon-d-arrow-left'
-const NEXT_YEAR = '.ant-picker-header-super-next-btn,.el-picker-panel__icon-btn.d-arrow-right,.el-date-picker__next-btn.el-icon-d-arrow-right'
-const PREV_MONTH = '.ant-picker-header-prev-btn,.el-picker-panel__icon-btn.arrow-left,.el-date-picker__prev-btn.el-icon-arrow-left'
-const NEXT_MONTH = '.ant-picker-header-next-btn,.el-picker-panel__icon-btn.arrow-right,.el-date-picker__next-btn.el-icon-arrow-right'
+const PREV_YEAR = '.ant-picker-header-super-prev-btn,.el-picker-panel__icon-btn.d-arrow-left,.el-date-picker__prev-btn.el-icon-d-arrow-left,[aria-label*="上一年"],[aria-label*="previous year"],[data-action="prev-year"]'
+const NEXT_YEAR = '.ant-picker-header-super-next-btn,.el-picker-panel__icon-btn.d-arrow-right,.el-date-picker__next-btn.el-icon-d-arrow-right,[aria-label*="下一年"],[aria-label*="next year"],[data-action="next-year"]'
+const PREV_MONTH = '.ant-picker-header-prev-btn,.el-picker-panel__icon-btn.arrow-left,.el-date-picker__prev-btn.el-icon-arrow-left,[aria-label*="上个月"],[aria-label*="previous month"],[data-action="prev-month"]'
+const NEXT_MONTH = '.ant-picker-header-next-btn,.el-picker-panel__icon-btn.arrow-right,.el-date-picker__next-btn.el-icon-arrow-right,[aria-label*="下个月"],[aria-label*="next month"],[data-action="next-month"]'
 
 interface DateParts {
   year: number
@@ -489,7 +546,13 @@ function shownYearMonth(popup: HTMLElement): { year: number; month: number } | n
   }
   const labels = Array.from(popup.querySelectorAll('.el-date-picker__header-label'))
   const year = Number(labels.map(node => node.textContent || '').join(' ').match(/(?:19|20)\d{2}/)?.[0])
-  if (!year) return null
+  if (!year) {
+    const header = popup.querySelector<HTMLElement>('.phoenix-picker-header,.ud-picker-header,[class*="picker-header"],[class*="calendar-header"]')
+    const text = (header?.textContent || '').replace(/\s+/g, ' ')
+    const genericYear = Number(text.match(/(?:19|20)\d{2}/)?.[0])
+    if (!genericYear) return null
+    return { year: genericYear, month: parseMonthText(text) }
+  }
   const monthLabel = labels.find(node => /月/.test(node.textContent || ''))
   return { year, month: parseMonthText(monthLabel?.textContent || '') }
 }
@@ -517,16 +580,16 @@ async function alignPicker(popup: HTMLElement, year: number, month: number): Pro
 }
 
 function clickCell(cell: HTMLElement): void {
-  const inner = cell.querySelector<HTMLElement>('.ant-picker-cell-inner,.el-date-table-cell,.el-date-table-cell__text,span') || cell
+  const inner = cell.querySelector<HTMLElement>('.ant-picker-cell-inner,.el-date-table-cell,.el-date-table-cell__text,.phoenix-picker-cell-inner,.ud-picker-cell-inner,span') || cell
   clickElement(inner)
 }
 
 function findDayCell(popup: HTMLElement, day: number): HTMLElement | null {
-  const cells = Array.from(popup.querySelectorAll<HTMLElement>('.ant-picker-cell-in-view,.el-date-table td.available,.el-date-table td'))
+  const cells = Array.from(popup.querySelectorAll<HTMLElement>('.ant-picker-cell-in-view,.el-date-table td.available,.el-date-table td,.phoenix-picker-cell,.ud-picker-cell,[data-date]'))
   return cells.find(cell => {
     const className = `${cell.className} ${cell.parentElement?.className || ''}`
     if (/disabled|prev-month|next-month/.test(className)) return false
-    const text = (cell.querySelector('.ant-picker-cell-inner,span') || cell).textContent?.trim()
+    const text = (cell.querySelector('.ant-picker-cell-inner,.phoenix-picker-cell-inner,.ud-picker-cell-inner,span') || cell).textContent?.trim()
     return text === String(day)
   }) || null
 }
@@ -536,7 +599,7 @@ function findMonthCell(popup: HTMLElement, year: number, month: number): HTMLEle
   const titled = popup.querySelector<HTMLElement>(`[title="${title}"]`)
   if (titled) return titled
   const labels = [String(month), `${month}月`, MONTH_NAMES[month - 1]].filter(Boolean)
-  const cells = Array.from(popup.querySelectorAll<HTMLElement>('.ant-picker-cell,.el-month-table td,.el-month-table .cell'))
+  const cells = Array.from(popup.querySelectorAll<HTMLElement>('.ant-picker-cell,.el-month-table td,.el-month-table .cell,.phoenix-picker-cell,.ud-picker-cell,[data-month]'))
   return cells.find(cell => {
     const text = (cell.textContent || '').replace(/\s+/g, '')
     return text.length <= 4 && labels.some(label => text === label.replace(/\s+/g, ''))
@@ -576,7 +639,7 @@ function clickOngoing(scope: ParentNode): boolean {
 }
 
 function rangeInputs(element: HTMLElement): HTMLInputElement[] {
-  const host = element.closest('.ant-picker-range,.el-range-editor,.el-date-editor--daterange,.el-date-editor--monthrange')
+  const host = element.closest(['.ant-picker-range,.el-range-editor,.el-date-editor--daterange,.el-date-editor--monthrange', PLATFORM_RANGE_SELECTOR].filter(Boolean).join(','))
   if (!host) return []
   return Array.from(host.querySelectorAll<HTMLInputElement>('input:not([type="hidden"])'))
 }
@@ -621,7 +684,7 @@ const datePickerRecognizer: ControlRecognizer = {
   async write(ctx, value) {
     const input = innerInput(ctx.ref.element)
     if (!input) return { applied: false, reasonCode: 'unsupported-control' }
-    const library = Boolean(input.closest('.ant-picker,.el-date-editor,.arco-picker,.ivu-date-picker,.n-date-picker,[class*="date-picker"],[class*="datepicker"],[class*="time-picker"]'))
+    const library = Boolean(input.closest(['.ant-picker,.el-date-editor,.arco-picker,.ivu-date-picker,.n-date-picker,[class*="date-picker"],[class*="datepicker"],[class*="time-picker"]', PLATFORM_DATE_SELECTOR].filter(Boolean).join(',')))
     const watch = watchForPopup(ctx.ref.element)
     try {
       const before = input.value.trim()
@@ -640,7 +703,7 @@ const datePickerRecognizer: ControlRecognizer = {
         return { applied: true }
       }
       input.focus()
-      clickElement(input.closest('.ant-picker,.el-date-editor,.arco-picker') || input)
+      clickElement(input.closest(['.ant-picker,.el-date-editor,.arco-picker', PLATFORM_DATE_SELECTOR].filter(Boolean).join(',')) || input)
       let picked = false
       if (library) {
         const popup = await watch.locate()
@@ -684,15 +747,172 @@ const datePickerRecognizer: ControlRecognizer = {
 // ─── 自定义下拉（combobox，含虚拟滚动 F18）──────────────────
 
 const MAX_FILTER_ATTEMPTS = 4
-const MAX_SCROLL_ATTEMPTS = 6
+const MAX_SCROLL_DURATION_MS = 6_000
 
-async function loadMoreOptions(popup: HTMLElement): Promise<void> {
-  const marked = popup.querySelector<HTMLElement>('.rc-virtual-list-holder,.el-scrollbar__wrap,.arco-virtual-list,.semi-select-option-list')
+function optionSignature(popup: HTMLElement): string {
+  return realOptions(popupOptions(popup)).map(optionText).join('\n')
+}
+
+/** 等待远程搜索或虚拟列表完成一轮更新，并连续两次保持稳定。 */
+async function waitForOptionsStable(popup: HTMLElement, previous = '', timeoutMs = 1_600): Promise<string> {
+  let latest = optionSignature(popup)
+  let stableRounds = 0
+  const settled = await pollUntil<string | null>(() => {
+    const current = optionSignature(popup)
+    if (current !== latest) {
+      latest = current
+      stableRounds = 0
+      return null
+    }
+    stableRounds += 1
+    if (stableRounds >= 2 && (current !== previous || stableRounds >= 3)) return current
+    return null
+  }, timeoutMs)
+  return settled ?? optionSignature(popup)
+}
+
+async function loadMoreOptions(popup: HTMLElement, trusted = false): Promise<'changed' | 'end' | 'stalled'> {
+  const marked = popup.querySelector<HTMLElement>('.rc-virtual-list-holder,.el-scrollbar__wrap,.arco-virtual-list,.semi-select-option-list,.phoenix-virtual-list,.ud-virtual-list,[class*="virtual-list-holder"]')
   const scroller = marked || Array.from(popup.querySelectorAll<HTMLElement>('*')).find(node => node.scrollHeight > node.clientHeight + 24)
-  if (!scroller) return
-  scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(scroller.clientHeight, 120))
-  scroller.dispatchEvent(new Event('scroll', { bubbles: true }))
-  await wait(180)
+  if (!scroller) return 'end'
+  const before = optionSignature(popup)
+  const previousTop = scroller.scrollTop
+  const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+  const delta = Math.max(scroller.clientHeight, 120)
+  const usedTrusted = trusted && await trustedScrollElement(scroller, delta)
+  if (!usedTrusted) {
+    scroller.scrollTop = Math.min(maxTop, previousTop + delta)
+    scroller.dispatchEvent(new Event('scroll', { bubbles: true }))
+  }
+  const after = await waitForOptionsStable(popup, before)
+  if (after !== before) return 'changed'
+  if (scroller.scrollTop >= maxTop - 1 || scroller.scrollTop === previousTop) return 'end'
+  return 'stalled'
+}
+
+/**
+ * ARIA 键盘路径：只有当 aria-activedescendant 的文字唯一命中目标时才发 Enter。
+ * ArrowDown 只改变高亮，不会在未确定目标时提交选择。
+ */
+async function selectByActiveDescendant(trigger: HTMLElement, popup: HTMLElement, value: string): Promise<boolean> {
+  const keyboardTarget = trigger instanceof HTMLInputElement
+    ? trigger
+    : trigger.querySelector<HTMLElement>('input,[role="combobox"],[tabindex]:not([tabindex="-1"])') || trigger
+  keyboardTarget.focus({ preventScroll: true })
+  const activeOption = () => {
+    const owner = [keyboardTarget, trigger].find(node => node.hasAttribute('aria-activedescendant'))
+    const id = owner?.getAttribute('aria-activedescendant')
+    const node = id ? keyboardTarget.ownerDocument.getElementById(id) : null
+    return node instanceof HTMLElement && (popup === node || popup.contains(node)) ? node : null
+  }
+  const commitIfMatched = () => {
+    const active = activeOption()
+    if (!active || matchOption([optionText(active)], value).index !== 0) return false
+    keyboardTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }))
+    keyboardTarget.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }))
+    return true
+  }
+  if (commitIfMatched()) return true
+  const limit = Math.min(40, Math.max(1, realOptions(popupOptions(popup)).length + 1))
+  for (let index = 0; index < limit; index += 1) {
+    keyboardTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true }))
+    keyboardTarget.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true }))
+    await wait(20)
+    if (commitIfMatched()) return true
+  }
+  return false
+}
+
+/** 对一个自定义下拉值完成“展开—搜索/滚动—点击”。多选会为每个值重复调用。 */
+async function selectCustomValue(trigger: HTMLElement, value: string, trusted = false, capabilities?: ControlCapabilities, allowProjection = false): Promise<WriteAttempt> {
+  trusted = trusted && capabilities?.canTrustedInput !== false
+  const alreadyOpen = visiblePopupFor(trigger)
+  const watch = watchForPopup(trigger)
+  try {
+    const clickable = trigger.querySelector<HTMLElement>(['.ant-select-selector,.el-select__wrapper,.el-input__wrapper,.el-input,.arco-select-view,.n-base-selection,.ivu-select-selection,.semi-select-selection,.t-select__wrap,.t-input__wrap', PLATFORM_SELECTION_ITEM_SELECTOR].filter(Boolean).join(',')) || trigger
+    if (!alreadyOpen) await activateElement(clickable, trusted)
+    const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>(['input:not([type="hidden"])', PLATFORM_SEARCH_INPUT_SELECTOR].filter(Boolean).join(','))
+    const popup = alreadyOpen || await watch.locate()
+    if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
+
+    if (!allowProjection && shouldStepCascade(value)) {
+      if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
+      return stepThroughOptions(popup, value, input, trusted, capabilities?.canSearch !== false)
+    }
+
+    const tryVisible = async (): Promise<WriteAttempt | null> => {
+      const options = popupOptions(popup)
+      const texts = options.map(option => optionText(option))
+      const match = matchOption(texts, value)
+      if (match.index >= 0 && !match.ambiguous) {
+        const option = options[match.index]
+        option.scrollIntoView?.({ block: 'nearest' })
+        await activateElement(option, trusted)
+        return { applied: true }
+      }
+      if (match.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
+      if (allowProjection) {
+        const projected = projectOptionFromValue(texts, value)
+        if (projected?.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个可投影匹配' }
+        if (projected && options[projected.index]) {
+          const option = options[projected.index]
+          option.scrollIntoView?.({ block: 'nearest' })
+          await activateElement(option, trusted)
+          return { applied: true }
+        }
+      }
+      return null
+    }
+
+    let visible = await tryVisible()
+    if (visible) { if (visible.applied) await wait(120); return visible }
+
+    if (capabilities?.canSearch !== false && input && !input.readOnly) {
+      const filters = [...new Set(Array.from({ length: MAX_FILTER_ATTEMPTS }, (_, index) =>
+        index === 0 ? value : value.slice(0, Math.max(1, value.length - index))))]
+      for (const filter of filters) {
+        const before = optionSignature(popup)
+        if (!trusted || !await trustedReplaceText(input, filter)) setNativeText(input, filter)
+        await waitForOptionsStable(popup, before)
+        visible = await tryVisible()
+        if (visible) { if (visible.applied) await wait(120); return visible }
+      }
+    }
+
+    if (capabilities?.canUseKeyboard !== false && await selectByActiveDescendant(trigger, popup, value)) {
+      await wait(120)
+      return { applied: true }
+    }
+
+    if (capabilities?.canScroll !== false) {
+      const deadline = Date.now() + MAX_SCROLL_DURATION_MS
+      let stalledRounds = 0
+      while (Date.now() < deadline) {
+        const outcome = await loadMoreOptions(popup, trusted)
+        visible = await tryVisible()
+        if (visible) { if (visible.applied) await wait(120); return visible }
+        if (outcome === 'end') break
+        stalledRounds = outcome === 'stalled' ? stalledRounds + 1 : 0
+        if (stalledRounds >= 2) break
+      }
+    }
+    return { applied: false, reasonCode: 'no-matching-option' }
+  } finally {
+    watch.dispose()
+  }
+}
+
+async function writeCustomSelection(ctx: ControlContext, value: string, trusted = false): Promise<WriteAttempt> {
+  const trigger = ctx.ref.element
+  const requested = ctx.ref.kind === 'multiselect' ? splitMulti(value) : [value.trim()]
+  if (!requested.length || requested.some(item => !item)) return { applied: false, reasonCode: 'no-matching-option' }
+  for (const item of requested) {
+    const result = await selectCustomValue(trigger, item, trusted, ctx.ref.control?.capabilities, ctx.request?.valueMode === 'match-options')
+    if (!result.applied) return result
+    // 组件可能在每次选择后关闭浮层；下一项重新从 visiblePopupFor 开始判断。
+    if (requested.length > 1) await wait(100)
+  }
+  return { applied: true }
 }
 
 const comboboxRecognizer: ControlRecognizer = {
@@ -701,55 +921,11 @@ const comboboxRecognizer: ControlRecognizer = {
   settleTimeoutMs: 2500,
   match: ref => ref.kind === 'combobox' || ref.kind === 'multiselect' && !(ref.element instanceof HTMLSelectElement),
   read: ctx => readCurrentValue(ctx.ref),
-  async write(ctx, value) {
-    const trigger = ctx.ref.element
-    const alreadyOpen = visiblePopupFor(trigger)
-    const watch = watchForPopup(trigger)
-    try {
-      const clickable = trigger.querySelector<HTMLElement>('.ant-select-selector,.el-select__wrapper,.el-input__wrapper,.el-input,.arco-select-view,.n-base-selection,.ivu-select-selection,.semi-select-selection,.t-select__wrap,.t-input__wrap') || trigger
-      if (!alreadyOpen) clickElement(clickable)
-      const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
-      const popup = alreadyOpen || await watch.locate()
-      if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
-
-      if (shouldStepCascade(value)) {
-        if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
-        return stepThroughOptions(popup, value, input)
-      }
-
-      // 输入筛选 → 滚动加载 → 重查（虚拟列表只渲染视口内的选项）
-      let scrolled = 0
-      for (let attempt = 0; attempt < MAX_FILTER_ATTEMPTS + MAX_SCROLL_ATTEMPTS; attempt += 1) {
-        const options = popupOptions(popup)
-        const texts = options.map(option => optionText(option))
-        const match = matchOption(texts, value)
-        if (match.index >= 0 && !match.ambiguous) {
-          const option = options[match.index]
-          option.scrollIntoView?.({ block: 'nearest' })
-          clickElement(option)
-          await wait(120)
-          return { applied: true }
-        }
-        if (match.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
-        // 尝试输入筛选后重查
-        if (input && !input.readOnly && attempt < MAX_FILTER_ATTEMPTS - 1) {
-          setNativeText(input, attempt === 0 ? value : value.slice(0, Math.max(1, value.length - attempt)))
-          await wait(320)
-        } else if (scrolled < MAX_SCROLL_ATTEMPTS) {
-          scrolled += 1
-          await loadMoreOptions(popup)
-        } else {
-          break
-        }
-      }
-      return { applied: false, reasonCode: 'no-matching-option' }
-    } finally {
-      watch.dispose()
-    }
-  },
+  write: (ctx, value) => writeCustomSelection(ctx, value),
+  trustedWrite: (ctx, value) => writeCustomSelection(ctx, value, true),
   async restore(ctx, previous) {
     const trigger = ctx.ref.element
-    const host = trigger.closest<HTMLElement>('.ant-select,.el-select,.arco-select') || trigger
+    const host = trigger.closest<HTMLElement>(['.ant-select,.el-select,.arco-select', PLATFORM_CONTROL_HOST_SELECTOR].filter(Boolean).join(',')) || trigger
     if (!previous) {
       const clear = host.querySelector<HTMLElement>('.ant-select-clear,.el-select__clear,.el-input__clear,[class*="clear"]')
       if (clear) { clickElement(clear); return true }
@@ -762,36 +938,40 @@ const comboboxRecognizer: ControlRecognizer = {
 
 // ─── 自定义级联（与普通下拉共用逐级点击）────────────────────
 
+async function writeCustomCascade(ctx: ControlContext, value: string, trusted = false): Promise<WriteAttempt> {
+  trusted = trusted && ctx.ref.control?.capabilities.canTrustedInput !== false
+  const trigger = ctx.ref.element
+  const alreadyOpen = visiblePopupFor(trigger)
+  const watch = watchForPopup(trigger)
+  const rollback = async () => {
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
+    const host = trigger.closest<HTMLElement>('.ant-cascader,.el-cascader') || trigger
+    const clear = host.querySelector<HTMLElement>('.ant-select-clear,.el-input__clear,[class*="clear"]')
+    if (clear) clickElement(clear)
+    await wait(100)
+  }
+  try {
+    if (!alreadyOpen) await activateElement(trigger, trusted)
+    const popup = alreadyOpen || await watch.locate()
+    if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
+    const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
+    if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
+    const stepped = await stepThroughOptions(popup, value, input, trusted, ctx.ref.control?.capabilities.canSearch !== false, true)
+    if (!stepped.applied) await rollback()
+    return stepped
+  } finally {
+    watch.dispose()
+  }
+}
+
 const cascaderRecognizer: ControlRecognizer = {
   id: 'custom-cascader',
   priority: 9,
   settleTimeoutMs: 3000,
   match: ref => ref.kind === 'cascade' && !(ref.element instanceof HTMLSelectElement),
   read: ctx => readCurrentValue(ctx.ref),
-  async write(ctx, value) {
-    const trigger = ctx.ref.element
-    const alreadyOpen = visiblePopupFor(trigger)
-    const watch = watchForPopup(trigger)
-    const rollback = async () => {
-      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
-      const host = trigger.closest<HTMLElement>('.ant-cascader,.el-cascader') || trigger
-      const clear = host.querySelector<HTMLElement>('.ant-select-clear,.el-input__clear,[class*="clear"]')
-      if (clear) clickElement(clear)
-      await wait(100)
-    }
-    try {
-      if (!alreadyOpen) clickElement(trigger)
-      const popup = alreadyOpen || await watch.locate()
-      if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
-      const input = trigger instanceof HTMLInputElement ? trigger : trigger.querySelector<HTMLInputElement>('input:not([type="hidden"])')
-      if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
-      const stepped = await stepThroughOptions(popup, value, input)
-      if (!stepped.applied) await rollback()
-      return stepped
-    } finally {
-      watch.dispose()
-    }
-  },
+  write: (ctx, value) => writeCustomCascade(ctx, value),
+  trustedWrite: (ctx, value) => writeCustomCascade(ctx, value, true),
   async restore(ctx, previous) {
     if (!previous) {
       const host = ctx.ref.element.closest<HTMLElement>('.ant-cascader,.el-cascader') || ctx.ref.element
@@ -818,7 +998,16 @@ const RECOGNIZERS: ControlRecognizer[] = [
 
 /** 按控件解析识别器：priority 大者优先，原生识别器兜底。 */
 export function resolveRecognizer(ref: FieldRef): ControlRecognizer | null {
-  const matched = RECOGNIZERS.filter(recognizer => recognizer.match(ref))
+  const capabilities = ref.control?.capabilities
+  const available = (recognizer: ControlRecognizer): boolean => {
+    if (!capabilities) return true
+    if (recognizer.id === 'native-text') return capabilities.canSetNativeValue || capabilities.canType
+    if (recognizer.id === 'native-select') return capabilities.canSetNativeValue || capabilities.canClick
+    if (recognizer.id === 'native-choice') return capabilities.canClick
+    if (recognizer.id === 'native-date') return capabilities.canSetNativeValue || capabilities.canType
+    return capabilities.canClick
+  }
+  const matched = RECOGNIZERS.filter(recognizer => recognizer.match(ref) && available(recognizer))
   if (!matched.length) return null
   return matched.sort((a, b) => b.priority - a.priority)[0]
 }

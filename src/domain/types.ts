@@ -4,6 +4,54 @@ export type DataSource = 'profile' | 'resume' | 'ai' | 'manual'
 
 export type FieldKind = 'text' | 'textarea' | 'select' | 'multiselect' | 'cascade' | 'radio' | 'checkbox' | 'combobox' | 'date' | 'file'
 
+/**
+ * 页面侧观测到的选项是否足以证明“目标值不存在”。
+ * 自定义下拉和虚拟列表通常只能看到当前渲染片段，不能当作完整值域。
+ */
+export type OptionCoverage = 'complete' | 'partial' | 'unknown'
+
+export type DiagnosticStage =
+  | 'discovery'
+  | 'classification'
+  | 'semantic-match'
+  | 'fact-join'
+  | 'value-gate'
+  | 'interaction'
+  | 'verification'
+  | 'visual'
+
+export type DiagnosticReason =
+  | 'unlabeled-control'
+  | 'unknown-control-type'
+  | 'unknown-slot'
+  | 'ambiguous-slot'
+  | 'no-profile-data'
+  | 'multiple-profile-candidates'
+  | 'blocked-by-complete-option-set'
+  | 'partial-option-set-search-required'
+  | 'multiple-option-candidates'
+  | 'value-validation-rejected'
+  | 'value-truncated'
+  | 'popup-not-found'
+  | 'remote-options-timeout'
+  | 'trusted-input-failed'
+  | 'readback-mismatch'
+  | 'validation-rejected'
+  | 'visual-not-eligible'
+  | 'visual-not-configured'
+  | 'visual-consensus-failed'
+  | 'restricted-frame'
+
+export interface FieldDiagnosticStep {
+  stage: DiagnosticStage
+  status: 'passed' | 'warning' | 'blocked' | 'skipped'
+  reason?: DiagnosticReason
+  strategy?: string
+  /** 只能写去标识化说明，禁止放入档案值或页面正文。 */
+  detail?: string
+  optionCoverage?: OptionCoverage
+}
+
 export type ValueType = FieldKind | 'array'
 
 /** 标签来源级别：来源越弱，打分时标签类信号权重越低（TECH_DESIGN §4.2）。 */
@@ -38,6 +86,9 @@ export interface FormField {
   /** 稳定字段指纹（F15），页面重渲染后不变。 */
   fingerprint: string
   frameId?: number
+  /** 命中的招聘平台能力包，用于诊断和平台改版回归。 */
+  platformId?: string
+  platformVersion?: string
   label: string
   labelSource?: LabelSource
   group: string
@@ -46,6 +97,8 @@ export interface FormField {
   placeholder: string
   kind: FieldKind
   options: string[]
+  /** 只有 complete 才允许值域闸门在执行前判定 no-matching-option。 */
+  optionCoverage?: OptionCoverage
   current: string
   required: boolean
   maxLength: number
@@ -55,8 +108,15 @@ export interface FormField {
   attrs?: FieldAttrs
   /** 重复段聚类 ID（F06）。 */
   repeatGroupId?: string
+  /**
+   * 从复合标签或段标题中识别出的记录限定词（例如某类记录的主体）。
+   * 这是数据驱动的段身份信号，不参与字段值本身。
+   */
+  recordQualifier?: string
   /** 字段附近提示文字（打分信号）。 */
   nearbyText?: string
+  /** 扫描阶段按最近共同容器发现的控件簇；仅表示页面结构，不代表业务语义。 */
+  controlClusterId?: string
   /** 起止时间合在同一个区间选择器里。 */
   range?: boolean
   /** 槽位判定（在内容脚本扫描时计算）。 */
@@ -67,6 +127,18 @@ export interface FormField {
   ruleId?: string
   /** 命中的已学别名（规范化后），用于成功/失败计数。 */
   learnedAlias?: string
+  /** 发现、分类与语义匹配阶段的去标识化诊断。 */
+  diagnostics?: FieldDiagnosticStep[]
+  /**
+   * 一条知识投影到多个页面控件时的运行时绑定。它描述控件形态，
+   * 不包含籍贯、日期等业务字段特判。
+   */
+  valueBinding?: {
+    groupId: string
+    shape: 'sequence' | 'tuple' | 'set' | 'range'
+    index: number
+    size: number
+  }
 }
 
 export interface PageContext {
@@ -74,6 +146,9 @@ export interface PageContext {
   url: string
   /** 各 frame 的可达性信息，用于面板提示不可扫描区域。 */
   frames?: Array<{ frameId: number; url: string; fieldCount: number }>
+  /** 顶层页面识别到的 ATS；字段所在 iframe 仍以 FormField.platformId 为准。 */
+  platformId?: string
+  platformName?: string
 }
 
 export interface FillRequest {
@@ -90,6 +165,14 @@ export interface FillRequest {
   slot?: string
   /** 本站曾经写成功的写法，先于档案原值尝试。 */
   priorValues?: string[]
+  /** 本站同类控件过去验证成功的交互策略。 */
+  preferredStrategy?: string
+  /** 已学习的父字段；执行序列会在保留基础优先级的同时做拓扑排序。 */
+  dependsOn?: string[]
+  /** 当前控件从知识原值中按自身真实选项唯一投影，而不是直接写入整个原值。 */
+  valueMode?: 'literal' | 'match-options'
+  /** 同一条知识对应的控件组；用于诊断、回读和反向聚合。 */
+  bindingGroupId?: string
 }
 
 /** 机器可读失败原因码（F14）。 */
@@ -98,6 +181,17 @@ export type FillReasonCode =
   | 'no-matching-option' | 'rejected-by-validation'
   | 'cleared-by-rerender' | 'readonly' | 'element-lost'
   | 'option-list-not-found' | 'timeout' | 'unsupported-control'
+  | 'trusted-input-failed'
+
+export type FillPipelineStage = 'locate' | 'precheck' | 'apply' | 'settle' | 'verify' | 'visual'
+
+export interface FillTraceStep {
+  stage: FillPipelineStage
+  status: 'ok' | 'retry' | 'failed' | 'skipped'
+  elapsedMs: number
+  strategy?: string
+  detail?: string
+}
 
 export interface FillResult {
   fieldId: string
@@ -109,6 +203,8 @@ export interface FillResult {
   reasonCode?: FillReasonCode
   attempts?: number
   elapsedMs?: number
+  /** 本地执行轨迹，不包含档案原值或页面正文。 */
+  trace?: FillTraceStep[]
 }
 
 export interface StoredProfile {
@@ -165,6 +261,8 @@ export interface ResolvedField {
   reasonCode?: FillReasonCode | 'multiple-candidates' | 'ambiguous-slot' | 'unknown-slot' | 'sensitive-blocked' | 'ai-suggested' | 'value-truncated'
   /** 该字段连接到的槽位。 */
   slot?: string
+  /** 从发现到值域闸门的完整诊断漏斗，不包含实际字段值。 */
+  diagnostics?: FieldDiagnosticStep[]
 }
 
 /**
@@ -216,6 +314,10 @@ export interface BackupPayload {
   learnedAliases?: LearnedAlias[]
   /** 本站写成功过的日期格式和选项说法，不含档案原值以外的个人数据映射键。 */
   fillRecipes?: FillRecipe[]
+  /** 本站同类控件已验证的交互策略，不含表单值。 */
+  interactionStrategies?: InteractionStrategyMemory[]
+  /** 由选项变化反复验证的字段依赖边，不含表单值。 */
+  fieldDependencies?: LearnedFieldDependency[]
 }
 
 /** 某站点某槽位写成功过的格式。options.from 是规范化后的档案值，to 是页面上的写法。 */
@@ -224,6 +326,28 @@ export interface FillRecipe {
   slot: string
   dateFormat?: string
   options: Array<{ from: string; to: string }>
+  updatedAt: string
+}
+
+export interface InteractionStrategyMemory {
+  domain: string
+  slot?: string
+  controlType: string
+  strategy: string
+  hitCount: number
+  failCount: number
+  disabled: boolean
+  updatedAt: string
+}
+
+export interface LearnedFieldDependency {
+  domain: string
+  parentFingerprint: string
+  childFingerprint: string
+  evidence: 'option-change'
+  hitCount: number
+  failCount: number
+  disabled: boolean
   updatedAt: string
 }
 

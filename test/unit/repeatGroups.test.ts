@@ -75,6 +75,17 @@ describe('detectRepeatGroup（F06 同构兄弟聚类）', () => {
     expect(detectRepeatGroup(radio2)?.item).toBe(2)
     expect(detectRepeatGroup(radio2)?.repeatGroupId).toBe(detectRepeatGroup(school2)?.repeatGroupId)
   })
+  it('某一段缺少可选字段时仍识别为同一个重复集合', () => {
+    document.body.innerHTML = `<section>
+      <div class="edu-block"><div><label>学校名称</label><input name="school_1" /></div><div><label>学历</label><input name="degree_1" /></div></div>
+      <div class="edu-block"><div><label>学校名称</label><input name="school_2" /></div></div>
+    </section>`
+    const first = document.querySelector<HTMLElement>('input[name="school_1"]')!
+    const second = document.querySelector<HTMLElement>('input[name="school_2"]')!
+    expect(detectRepeatGroup(first)?.item).toBe(1)
+    expect(detectRepeatGroup(second)?.item).toBe(2)
+    expect(detectRepeatGroup(first)?.repeatGroupId).toBe(detectRepeatGroup(second)?.repeatGroupId)
+  })
   it('非重复布局返回 null', () => {
     document.body.innerHTML = '<form><div><label>姓名</label><input /></div><div><label>邮箱</label><input type="email" /></div></form>'
     const input = document.querySelector('input')!
