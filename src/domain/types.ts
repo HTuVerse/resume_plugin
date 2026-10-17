@@ -203,6 +203,11 @@ export interface FillResult {
   reasonCode?: FillReasonCode
   attempts?: number
   elapsedMs?: number
+  /**
+   * 该值是通过「模糊投影」选中的最匹配选项（而非精确/同义命中），
+   * 需要用户在核对界面复核。面板据此归入「待确认」并用橙色高亮。
+   */
+  needsReview?: boolean
   /** 本地执行轨迹，不包含档案原值或页面正文。 */
   trace?: FillTraceStep[]
 }

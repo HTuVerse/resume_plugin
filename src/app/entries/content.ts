@@ -5,10 +5,13 @@ import { clickAddForSection, clickAddNear } from '../../features/autofill/scan/r
 import { isElementVisible, pollUntil, wait } from '../../features/autofill/write/domUtils'
 import { normalize } from '../../shared/normalize'
 import { isPlaceholderOption } from '../../features/ontology/optionMatch'
+import { slotById } from '../../features/ontology/slotRegistry'
 import { scoreFieldSlots, decideSlot } from '../../features/autofill/match/fieldToSlot'
+import { subjectSectionOf } from '../../features/autofill/match/subjectScope'
 import { inferQualifiedField } from '../../features/ontology/recordIdentity'
 import { executeFillSequence, undoRecord, type UndoRecord } from '../../features/autofill/write/writeMachine'
-import { createVisualRecovery, warmupVisualAssist } from '../../features/autofill/write/visualFallback'
+import { subscribeTrustedInput } from '../../features/autofill/write/trustedInput'
+import { warmupVisualAssist } from '../../features/autofill/write/visualFallback'
 import { loadFillRecipes, priorValuesFor, recipeFor, rememberSuccessfulFill } from '../../features/autofill/write/fillRecipes'
 import { loadLearnedAliases } from '../../features/ontology/learnedAliases'
 import { probeEmptyChoiceOptions } from '../../features/autofill/scan/probeOptions'
@@ -18,6 +21,7 @@ import { LICENSE_REQUIRED_MESSAGE, loadLicense } from '../../features/license/li
 import { loadInteractionStrategies, preferredStrategyFor, recordInteractionStrategy, successfulStrategy } from '../../features/autofill/learning/strategyMemory'
 import { applyLearnedDependencies, captureOptionStates, changedOptionFields, loadFieldDependencies, recordDependencyOutcome, recordFieldDependencies } from '../../features/autofill/learning/dependencyStore'
 import { recordQualityResult } from '../../features/autofill/learning/qualityMetrics'
+import type { FillOverlayState } from '../bridge/panelBridge'
 import {
   PLATFORM_CHOICE_WRAPPER_SELECTOR,
   PLATFORM_DATE_SELECTOR,
@@ -37,7 +41,7 @@ import {
 
 declare global { interface Window { __resumeFormAssistantRuntime?: string } }
 
-const CONTENT_RUNTIME = 'hongtu-resume-autofill-2.1.0'
+const CONTENT_RUNTIME = 'hongtu-resume-autofill-2.3.0'
 const IS_COORDINATOR = window.top === window
 
 if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
@@ -52,6 +56,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   let hasScanned = false
   /** 插件自己写入期间不把回读当成用户输入。 */
   let learnPaused = false
+  let fillEpoch = 0
   const learnState = new Map<string, { timer: number; started: number; ref: FieldRef; picked: string }>()
   /** 点过的单选。页面只改样式、回读仍是旧值时，用这次点中的文字。 */
   const choiceOverride = new Map<string, { text: string; previous: string }>()
@@ -292,7 +297,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   })
 
   async function frameScan(probeOptions = false): Promise<{ fields: FormField[]; url: string; title: string }> {
-    const [rules, learnedAliases] = await Promise.all([
+    const metadata = Promise.all([
       loadSiteRules().then(rows => rulesForDomain(rows, location.hostname)).catch(() => []),
       loadLearnedAliases().catch(() => [])
     ])
@@ -300,16 +305,22 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     refs = output.refs
     scannedFields = output.fields
     if (probeOptions) await probeEmptyChoiceOptions(output.fields, refs).catch(() => undefined)
+    const [rules, learnedAliases] = await metadata
     hasScanned = true
     lastFingerprints = new Set(output.fields.map(field => field.fingerprint))
     for (const field of output.fields) {
+      field.sectionId = subjectSectionOf(field) || undefined
       const scores = scoreFieldSlots(field, { siteRules: rules, learnedAliases })
       const decision = decideSlot(scores, field.sectionId)
       const qualified = inferQualifiedField(field)
+      const highest = decision.candidates[0]
+      const hasSemanticSignal = Boolean(highest && (highest.signals.labelMatch || highest.signals.attrAlias || highest.signals.enumSignature))
+      const highestCompatible = Boolean(field.sectionId && slotById(highest?.slot || '')?.section === field.sectionId)
+      const ambiguousChoice = decision.status === 'ambiguous' && hasSemanticSignal && highestCompatible ? highest?.slot : undefined
       field.slotCandidates = decision.candidates
       field.recordQualifier = qualified?.qualifier
       field.slotStatus = decision.status === 'resolved' || !qualified?.slot ? decision.status : 'resolved'
-      field.slot = decision.slot || qualified?.slot
+      field.slot = decision.slot || qualified?.slot || ambiguousChoice
       field.diagnostics = scanDiagnostics(field)
       if (decision.candidates[0]?.signals.learnedAlias) field.learnedAlias = normalize(field.label)
       if (decision.candidates[0]?.signals.siteRule) {
@@ -364,8 +375,9 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     }
   }
 
-  async function frameFill(values: FillRequest[], resetUndo: boolean): Promise<FillResult[]> {
+  async function frameFill(values: FillRequest[], resetUndo: boolean, runId?: string): Promise<FillResult[]> {
     learnPaused = true
+    const epoch = ++fillEpoch
     try {
       if (resetUndo) undoStack = []
       const domain = location.hostname
@@ -390,11 +402,20 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
         }
       }), dependencies)
       const results: FillResult[] = []
-      // 顶层页面在批量开始时立即预热扩展内 OCR；普通字段继续走 DOM，互不等待。
-      // iframe 坐标相对其自身视口，未校准到顶层前不做真实坐标点击，避免误点。
-      const visualRecovery = IS_COORDINATOR ? createVisualRecovery() : undefined
-      const executions = await executeFillSequence(prepared, fieldId => locateRef(fieldId), visualRecovery, {
+      // 自动填写只使用页面控件交互，避免浏览器显示调试提示和短暂隐藏助手界面。
+      const executions = await executeFillSequence(prepared, fieldId => locateRef(fieldId), undefined, {
         async after(request, execution, ref) {
+          if (execution.result.status === 'filled' && execution.undo) {
+            undoStack.push(execution.undo)
+            highlight(execution.undo.ref, execution.result)
+            if (request.slot && execution.result.value) {
+              rememberSuccessfulFill(location.hostname, request.slot, request.value, execution.result.value).catch(() => undefined)
+            }
+          }
+          if (runId) {
+            if (IS_COORDINATOR) postPanelEvent({ type: 'FILL_PROGRESS', runId, result: { ...execution.result, fieldId: fieldIdOf(0, execution.result.fieldId) } })
+            else chrome.runtime.sendMessage({ type: 'FRAME_FILL_PROGRESS', runId, result: execution.result }).catch(() => undefined)
+          }
           const controlType = ref?.control?.type || ref?.kind || 'unknown'
           const strategy = successfulStrategy(execution.result)
           const learning: Array<Promise<unknown>> = [recordQualityResult(domain, controlType, execution.result)]
@@ -424,20 +445,10 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
         }
       })
       watchLearnedInputs()
-      for (const execution of executions) {
-        if (execution.result.status === 'filled' && execution.undo) {
-          undoStack.push(execution.undo)
-          highlight(execution.undo.ref, execution.result)
-          const request = values.find(item => item.fieldId === execution.result.fieldId)
-          if (request?.slot && execution.result.value) {
-            rememberSuccessfulFill(location.hostname, request.slot, request.value, execution.result.value).catch(() => undefined)
-          }
-        }
-        results.push(execution.result)
-      }
+      for (const execution of executions) results.push(execution.result)
       return results
     } finally {
-      window.setTimeout(() => { learnPaused = false }, 700)
+      window.setTimeout(() => { if (fillEpoch === epoch) learnPaused = false }, 700)
     }
   }
 
@@ -475,13 +486,17 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   function highlight(ref: FieldRef, result: FillResult): void {
     if (!featureSettings.autoHighlight) return
-    const pending = result.source === 'ai'
+    const pending = result.source === 'ai' || result.needsReview === true || (result.confidence != null && result.confidence < 0.85)
     for (const element of elementsOf(ref)) {
       element.setAttribute('data-resume-assistant-filled', 'true')
       element.setAttribute('data-resume-assistant-state', pending ? 'pending' : 'confirmed')
-      element.setAttribute('title', pending
-        ? `鸿途网申助手：AI 判定语义（置信度 ${Math.round((result.confidence || 0) * 100)}%），请确认`
-        : `鸿途网申助手：已填写并回读确认`)
+      element.setAttribute('title', result.source === 'ai'
+        ? `鸿途网申助手：AI 判定语义并已填写（置信度 ${Math.round((result.confidence || 0) * 100)}%）`
+        : result.confidence != null && result.confidence < 0.85
+          ? `鸿途网申助手：已按最高置信候选填写（${Math.round(result.confidence * 100)}%），请留意`
+          : result.needsReview
+          ? `鸿途网申助手：已按最匹配选项填写，橙色提示`
+          : `鸿途网申助手：已填写并回读确认`)
       element.style.outline = pending ? '2px solid #e28a13' : '2px solid #20744c'
       element.style.outlineOffset = '1px'
     }
@@ -564,7 +579,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     return { clicked }
   }
 
-  chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number; probeOptions?: boolean; demands?: Array<{ section: string; missing: number }> }, _sender, respond) => {
+  chrome.runtime.onMessage.addListener((message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; sourceFrameId?: number; resetUndo?: boolean; added?: number; probeOptions?: boolean; runId?: string; result?: FillResult; demands?: Array<{ section: string; missing: number }> }, _sender, respond) => {
     if (message.type === 'PANEL_OPEN' && IS_COORDINATOR) {
       mountPanel()
       respond({})
@@ -583,7 +598,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     }
     if (message.type === 'FRAME_FILL') {
       denyUnlessLicensed(respond, () => {
-        frameFill(message.values || [], message.resetUndo !== false).then(results => respond({ results })).catch(error => respond({ error: String(error) }))
+        frameFill(message.values || [], message.resetUndo !== false, message.runId).then(results => respond({ results })).catch(error => respond({ error: String(error) }))
       })
       return true
     }
@@ -618,6 +633,11 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
       respond({})
       return false
     }
+    if (message.type === 'FRAME_FILL_PROGRESS' && IS_COORDINATOR && message.result && message.runId) {
+      postPanelEvent({ type: 'FILL_PROGRESS', runId: message.runId, result: { ...message.result, fieldId: fieldIdOf(message.sourceFrameId ?? 0, message.result.fieldId) } })
+      respond({})
+      return false
+    }
     return false
   })
 
@@ -630,6 +650,12 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   let panelFrame: HTMLIFrameElement | null = null
   let stopPanelDrag: (() => void) | null = null
   let panelPosition: { left: number; top: number } | null = null
+  let panelBusy = false
+  let fillOverlayHost: HTMLElement | null = null
+  let fillOverlayDialog: HTMLElement | null = null
+  let trustedInputDepth = 0
+  let unsubscribeTrustedInput: (() => void) | null = null
+  let fillOverlayHideTimer: number | null = null
   let pickerCleanup: (() => void) | null = null
   let lastFocusedFieldId: string | null = null
   const panelOrigin = new URL(chrome.runtime.getURL('/')).origin
@@ -658,8 +684,9 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     const fields: FormField[] = []
     const frames: Array<{ frameId: number; url: string; fieldCount: number }> = []
     let pageTitle = document.title
-    for (const frameId of frameIds) {
-      const response = await frameCall<{ fields?: FormField[]; url?: string; title?: string; error?: string } | null>(frameId, { type: 'FRAME_SCAN', probeOptions }).catch(() => null)
+    const scanned = await Promise.all(frameIds.map(frameId => frameCall<{ fields?: FormField[]; url?: string; title?: string; error?: string } | null>(frameId, { type: 'FRAME_SCAN', probeOptions }).catch(() => null)))
+    for (const [index, frameId] of frameIds.entries()) {
+      const response = scanned[index]
       if (!response?.fields) continue
       for (const field of response.fields) {
         field.frameId = frameId
@@ -677,7 +704,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
     return { fields, context: { pageTitle, url: location.href, frames, platformId: topPlatform?.platformId, platformName } }
   }
 
-  async function aggregateFill(values: FillRequest[], resetUndo = true): Promise<FillResult[]> {
+  async function aggregateFill(values: FillRequest[], resetUndo = true, runId?: string): Promise<FillResult[]> {
     const groups = new Map<number, FillRequest[]>()
     for (const request of values) {
       const { frameId, fingerprint } = splitFieldId(request.fieldId)
@@ -693,14 +720,12 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
         await frameCall(frameId, { type: 'FRAME_FILL', values: [], resetUndo: true }).catch(() => null)
       }
     }
-    const results: FillResult[] = []
-    for (const [frameId, group] of groups) {
-      const response = await frameCall<{ results?: FillResult[]; error?: string } | null>(frameId, { type: 'FRAME_FILL', values: group, resetUndo }).catch(() => null)
-      for (const result of response?.results || group.map(request => ({ fieldId: request.fieldId, status: 'failed' as const, message: '目标 frame 无响应', reasonCode: 'element-lost' as const }))) {
-        results.push({ ...result, fieldId: fieldIdOf(frameId, result.fieldId) })
-      }
-    }
-    return results
+    const frameResults = await Promise.all([...groups].map(async ([frameId, group]) => {
+      const response = await frameCall<{ results?: FillResult[]; error?: string } | null>(frameId, { type: 'FRAME_FILL', values: group, resetUndo, runId }).catch(() => null)
+      return (response?.results || group.map(request => ({ fieldId: request.fieldId, status: 'failed' as const, message: '目标 frame 无响应', reasonCode: 'element-lost' as const })))
+        .map(result => ({ ...result, fieldId: fieldIdOf(frameId, result.fieldId) }))
+    }))
+    return frameResults.flat()
   }
 
   async function aggregateValues(): Promise<{ values: Array<{ fieldId: string; value: string }> }> {
@@ -847,6 +872,129 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   type PanelMode = keyof typeof PANEL_SIZES
 
+  const LOCKED_INPUT_EVENTS = ['pointerdown', 'pointerup', 'click', 'dblclick', 'contextmenu', 'wheel', 'touchstart', 'touchmove', 'keydown', 'keyup', 'beforeinput', 'dragstart'] as const
+
+  function blockPageInput(event: Event): void {
+    if (!fillOverlayHost || trustedInputDepth > 0 || !event.isTrusted) return
+    if (event.cancelable) event.preventDefault()
+    event.stopImmediatePropagation()
+  }
+
+  function onTrustedInput(active: boolean): void {
+    trustedInputDepth = Math.max(0, trustedInputDepth + (active ? 1 : -1))
+    if (fillOverlayHost) fillOverlayHost.style.pointerEvents = trustedInputDepth ? 'none' : 'auto'
+  }
+
+  function clearFillOverlay(): void {
+    if (fillOverlayHideTimer !== null) window.clearTimeout(fillOverlayHideTimer)
+    fillOverlayHideTimer = null
+    if (!fillOverlayHost) return
+    fillOverlayHost.remove()
+    fillOverlayHost = null
+    fillOverlayDialog = null
+    trustedInputDepth = 0
+    panelHost?.style.setProperty('pointer-events', 'auto')
+    panelFrame?.style.setProperty('pointer-events', 'auto')
+    for (const type of LOCKED_INPUT_EVENTS) window.removeEventListener(type, blockPageInput, true)
+    unsubscribeTrustedInput?.()
+    unsubscribeTrustedInput = null
+  }
+
+  function mountFillOverlay(): void {
+    if (fillOverlayHost) return
+    fillOverlayHost = document.createElement('div')
+    fillOverlayHost.id = 'resume-form-assistant-fill-overlay'
+    fillOverlayHost.setAttribute('data-resume-assistant', 'fill-overlay')
+    fillOverlayHost.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:auto;'
+    const shadow = fillOverlayHost.attachShadow({ mode: 'closed' })
+    shadow.innerHTML = `
+      <style>
+        * { box-sizing: border-box; }
+        .backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; background: rgba(7, 24, 61, .42); backdrop-filter: blur(3px); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+        .dialog { width: min(390px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 15px 22px 21px; border: 1px solid rgba(255,255,255,.95); border-radius: 22px; background: radial-gradient(circle at 50% 8%, #d1e5ff 0, #eff5ff 44%, #fff 100%); box-shadow: 0 18px 55px rgba(5, 31, 84, .28), inset 0 1px 0 #fff; color: #10275a; text-align: center; outline: none; }
+        .art { display: block; width: 184px; height: 112px; margin: 0 auto 1px; object-fit: cover; object-position: center; filter: drop-shadow(0 5px 10px rgba(30,105,229,.15)); }
+        h2 { margin: 0; font-size: 21px; line-height: 1.35; font-weight: 750; letter-spacing: .02em; }
+        .subtitle { margin: 4px 0 17px; color: #65799f; font-size: 12px; }
+        .steps { position: relative; display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; margin-bottom: 18px; }
+        .steps::before { content: ''; position: absolute; top: 17px; left: 17%; right: 17%; height: 3px; border-radius: 4px; background: #cbd8ee; }
+        .step { position: relative; z-index: 1; min-width: 0; }
+        .bubble { display: grid; place-items: center; width: 35px; height: 35px; margin: 0 auto 7px; border: 2px solid #fff; border-radius: 50%; background: #d5e0f2; box-shadow: 0 2px 9px rgba(30, 77, 144, .13); color: #61759c; font-size: 15px; font-weight: 700; }
+        .step.is-current .bubble { background: linear-gradient(135deg, #275fff, #15b9f3); box-shadow: 0 0 0 5px rgba(63, 154, 255, .16), 0 3px 12px rgba(33, 111, 228, .3); color: #fff; }
+        .step.is-done .bubble { background: #2177ee; color: #fff; }
+        .step-label { display: block; font-size: 11px; font-weight: 700; white-space: nowrap; }
+        .step.is-current .step-label { color: #1269e9; }
+        .step-note { display: block; margin-top: 3px; color: #8191af; font-size: 10px; white-space: nowrap; }
+        .progress-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 6px; color: #47648f; font-size: 11px; font-weight: 650; }
+        .progress-track { height: 8px; overflow: hidden; border-radius: 99px; background: #d9e6f8; }
+        .progress-fill { height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, #2b68f9, #18c6ed); transition: width .24s ease; }
+        .progress-track.is-indeterminate .progress-fill { width: 36%; animation: glide 1.3s ease-in-out infinite alternate; }
+        .detail { min-height: 15px; margin: 9px 0 0; overflow: hidden; color: #7285a7; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+        @keyframes glide { from { transform: translateX(-100%); } to { transform: translateX(280%); } }
+        @media (max-height: 370px) { .art { height: 68px; } .subtitle { margin-bottom: 9px; } .steps { margin-bottom: 10px; } }
+      </style>
+      <div class="backdrop"><section class="dialog" role="dialog" aria-modal="true" aria-labelledby="fill-overlay-title" aria-describedby="fill-overlay-subtitle" tabindex="-1">
+        <img class="art" alt="" />
+        <h2 id="fill-overlay-title">正在处理，请稍候</h2>
+        <p id="fill-overlay-subtitle" class="subtitle">系统将自动完成识别、检测与填写</p>
+        <div class="steps" aria-label="填写阶段">
+          <div class="step" data-step="local"><span class="bubble">1</span><span class="step-label">本地识别填写</span><span class="step-note">等待中</span></div>
+          <div class="step" data-step="ai"><span class="bubble">2</span><span class="step-label">AI 检测与填写</span><span class="step-note">等待中</span></div>
+          <div class="step" data-step="done"><span class="bubble">3</span><span class="step-label">完成</span><span class="step-note">等待中</span></div>
+        </div>
+        <div class="progress-head"><span class="progress-stage"></span><span class="progress-count"></span></div>
+        <div class="progress-track" role="progressbar" aria-label="识别与填写进度"><div class="progress-fill"></div></div>
+        <p class="detail" role="status" aria-live="polite"></p>
+      </section></div>`
+    shadow.querySelector<HTMLImageElement>('.art')!.src = chrome.runtime.getURL('assets/ui/ai-processing.png')
+    fillOverlayDialog = shadow.querySelector<HTMLElement>('.dialog')
+    document.documentElement.append(fillOverlayHost)
+    panelHost?.style.setProperty('pointer-events', 'none')
+    panelFrame?.style.setProperty('pointer-events', 'none')
+    for (const type of LOCKED_INPUT_EVENTS) window.addEventListener(type, blockPageInput, { capture: true, passive: false })
+    unsubscribeTrustedInput = subscribeTrustedInput(onTrustedInput)
+    fillOverlayDialog?.focus({ preventScroll: true })
+  }
+
+  function updateFillOverlay(state: FillOverlayState | null): void {
+    if (!state) { clearFillOverlay(); return }
+    if (fillOverlayHideTimer !== null) window.clearTimeout(fillOverlayHideTimer)
+    fillOverlayHideTimer = null
+    mountFillOverlay()
+    // 关闭的 shadow root 通过 dialog 引用继续访问，页面脚本不能改写弹窗内容。
+    const root = fillOverlayDialog?.parentElement
+    if (!root) return
+    const finished = state.phase === 'done'
+    const localDone = state.phase === 'ai' || finished
+    root.querySelector<HTMLElement>('#fill-overlay-title')!.textContent = finished ? '处理结束' : '正在处理，请稍候'
+    for (const name of ['local', 'ai', 'done'] as const) {
+      const step = root.querySelector<HTMLElement>(`[data-step="${name}"]`)
+      if (!step) continue
+      const active = name === 'local' ? !localDone : name === 'ai' ? state.phase === 'ai' : finished
+      const complete = name === 'local' && localDone || name === 'ai' && finished && state.aiTotal > 0
+      step.classList.toggle('is-current', active)
+      step.classList.toggle('is-done', complete)
+      step.querySelector<HTMLElement>('.bubble')!.textContent = complete ? '✓' : name === 'local' ? '1' : name === 'ai' ? '2' : '3'
+      step.querySelector<HTMLElement>('.step-note')!.textContent = complete
+        ? '已完成' : name === 'ai' && finished ? '未启用' : active ? finished ? '已结束' : '进行中' : '等待中'
+    }
+    const scanning = state.phase === 'scan'
+    const current = localDone ? state.aiAnalyzed : state.processed
+    const total = localDone ? state.aiTotal : state.total
+    const percent = finished ? 100 : total > 0 ? Math.min(100, Math.round(current / total * 100)) : 0
+    root.querySelector<HTMLElement>('.progress-stage')!.textContent = finished ? '本轮处理已结束' : scanning ? '正在扫描表单' : localDone ? 'AI 已处理字段' : '本地已处理字段'
+    root.querySelector<HTMLElement>('.progress-count')!.textContent = finished ? '完成' : scanning ? '读取中' : total ? `${current} / ${total}` : '准备中'
+    const track = root.querySelector<HTMLElement>('.progress-track')!
+    track.classList.toggle('is-indeterminate', !finished && (scanning || total === 0))
+    track.setAttribute('aria-valuemin', '0')
+    track.setAttribute('aria-valuemax', String(total || 100))
+    if (finished) track.setAttribute('aria-valuenow', String(total || 100))
+    else if (total && !scanning) track.setAttribute('aria-valuenow', String(Math.min(current, total)))
+    else track.removeAttribute('aria-valuenow')
+    root.querySelector<HTMLElement>('.progress-fill')!.style.width = !finished && (scanning || total === 0) ? '' : `${percent}%`
+    root.querySelector<HTMLElement>('.detail')!.textContent = state.status
+    if (finished) fillOverlayHideTimer = window.setTimeout(clearFillOverlay, 550)
+  }
+
   function availablePanelSize(mode: PanelMode): { width: number; height: number } {
     const size = PANEL_SIZES[mode]
     return {
@@ -864,6 +1012,8 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   function closePanelView(): void {
     stopPanelDrag?.()
+    clearFillOverlay()
+    panelBusy = false
     panelHost?.remove()
     panelHost = null
     panelFrame = null
@@ -925,7 +1075,7 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   }
 
   function startPanelDrag(offsetX: number, offsetY: number): void {
-    if (!panelHost || !panelFrame) return
+    if (!panelHost || !panelFrame || panelBusy) return
     stopPanelDrag?.()
     const host = panelHost
     const frame = panelFrame
@@ -969,12 +1119,12 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
 
   // ─── 面板消息路由（仅 COORDINATOR）──────────────────────────
 
-  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; probeOptions?: boolean; resetUndo?: boolean; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
+  async function handlePanelMessage(message: { type: string; values?: FillRequest[]; fieldId?: string; value?: string; source?: FillRequest['source']; confidence?: number; copied?: boolean; probeOptions?: boolean; resetUndo?: boolean; runId?: string; demands?: Array<{ section: string; missing: number }> }): Promise<unknown> {
     if (!(await loadLicense())) return { error: LICENSE_REQUIRED_MESSAGE }
     if (message.type === 'SCAN') return aggregateScan(message.probeOptions === true)
     if (message.type === 'VISUAL_STATUS') return warmupVisualAssist()
     if (message.type === 'EXPAND_REPEATS') return aggregateExpand(message.demands || [])
-    if (message.type === 'FILL') return aggregateFill(message.values || [], message.resetUndo !== false).then(results => ({ results }))
+    if (message.type === 'FILL') return aggregateFill(message.values || [], message.resetUndo !== false, message.runId).then(results => ({ results }))
     if (message.type === 'UNDO') return aggregateUndo().then(results => ({ results }))
     if (message.type === 'READ_VALUES') return aggregateValues()
     if (message.type === 'MANUAL_FILL') return manualFill(message as { fieldId: string; value: string; source?: FillRequest['source']; confidence?: number; copied?: boolean })
@@ -992,7 +1142,10 @@ if (window.__resumeFormAssistantRuntime !== CONTENT_RUNTIME) {
   if (IS_COORDINATOR) {
     window.addEventListener('message', event => {
       if (!panelFrame || event.source !== panelFrame.contentWindow || event.origin !== panelOrigin || event.data?.type !== 'PANEL_REQUEST') return
-      const { requestId, message } = event.data as { requestId: string; message: { type: string; mode?: 'compact' | 'expanded' | 'activation'; clientX?: number; clientY?: number } }
+      const { requestId, message } = event.data as { requestId: string; message: { type: string; mode?: 'compact' | 'expanded' | 'activation'; clientX?: number; clientY?: number; busy?: boolean; state?: FillOverlayState | null } }
+      if (message.type === 'SET_PANEL_BUSY') { panelBusy = message.busy === true; if (panelBusy) stopPanelDrag?.(); return }
+      if (message.type === 'SET_FILL_OVERLAY') { updateFillOverlay(message.state || null); return }
+      if (panelBusy && ['CLOSE_PANEL', 'MINIMIZE_PANEL', 'RESIZE_PANEL', 'DRAG_PANEL'].includes(message.type)) return
       if (message.type === 'CLOSE_PANEL') { closePanelManually(); return }
       if (message.type === 'MINIMIZE_PANEL') { closePanelView(); return }
       if (message.type === 'RESIZE_PANEL') { resizePanelHost(message.mode || 'compact'); return }

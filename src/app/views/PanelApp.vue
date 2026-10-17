@@ -18,7 +18,7 @@ import { pageSegmentItem, samePageSegment } from '../../features/autofill/pageSe
 import { bindObservedRepeatRecords, bindRepeatRecords } from '../../features/autofill/repeatBinding'
 import { splitIdentityFillRequests } from '../../features/autofill/fillPhases'
 import { recordCorrection, recordFailure, recordHit, recordObservation } from '../../features/siteRules/ruleStore'
-import { beginPanelDrag, closePanel, onContentEvent, requestContent, resizePanel } from '../bridge/panelBridge'
+import { beginPanelDrag, closePanel, onContentEvent, requestContent, resizePanel, setFillOverlay, setPanelBusy } from '../bridge/panelBridge'
 import { loadAiSettings, loadCurrentResume, loadProfile, saveProfile } from '../../infrastructure/storage/store'
 import { activate, loadLicense, type LicenseRecord } from '../../features/license/license'
 import type { AiSettings, CurrentResume, Fact, FillRequest, FillResult, FormField, LearnedAlias, PageContext, ResolvedField, SlotSuggestion } from '../../domain/types'
@@ -72,12 +72,12 @@ const polishableFields = computed(() => fields.value.filter(field => field.kind 
 
 const aiReady = computed(() => Boolean(aiSettings.value.url && aiSettings.value.key && aiSettings.value.model))
 const visualHealthText = computed(() => {
-  if (visualHealth.value.checking) return '视觉辅助：正在检查本地 OCR…'
-  if (!visualHealth.value.ocrAvailable) return `视觉辅助：本地 OCR 不可用${visualHealth.value.error ? `（${visualHealth.value.error}）` : ''}`
-  if (!visualHealth.value.aiAvailable) return '视觉辅助：OCR 已就绪 · 视觉模型未配置'
-  if (visualHealth.value.aiVerified) return '视觉辅助：OCR 已就绪 · 图片能力已验证'
-  if (visualHealth.value.aiRejected) return '视觉辅助：OCR 已就绪 · 图片能力测试失败'
-  return '视觉辅助：OCR 已就绪 · 模型已配置（图片能力未验证）'
+  if (visualHealth.value.checking) return '视觉自动点击已关闭 · 正在检查本地 OCR…'
+  if (!visualHealth.value.ocrAvailable) return `视觉自动点击已关闭 · 本地 OCR 不可用${visualHealth.value.error ? `（${visualHealth.value.error}）` : ''}`
+  if (!visualHealth.value.aiAvailable) return '视觉自动点击已关闭 · OCR 已就绪'
+  if (visualHealth.value.aiVerified) return '视觉自动点击已关闭 · OCR 与图片能力已就绪'
+  if (visualHealth.value.aiRejected) return '视觉自动点击已关闭 · 图片能力测试失败'
+  return '视觉自动点击已关闭 · OCR 已就绪，图片能力未验证'
 })
 // 知识库（我的信息）是唯一填充数据源
 const allFacts = computed(() => mergeFactsByPriority(facts.value))
@@ -95,6 +95,21 @@ const activationCode = ref('')
 const activationError = ref('')
 const activating = ref(false)
 const autoFillRunning = ref(false)
+const fillProgress = reactive({ phase: 'idle' as 'idle' | 'scan' | 'local' | 'ai' | 'done', processed: 0, total: 0, aiAnalyzed: 0, aiTotal: 0 })
+watch(() => [autoFillRunning.value, fillProgress.phase, fillProgress.processed, fillProgress.total,
+  fillProgress.aiAnalyzed, fillProgress.aiTotal, status.value] as const, () => {
+  if (!autoFillRunning.value || fillProgress.phase === 'done' || fillProgress.phase === 'idle') return
+  setFillOverlay({
+    phase: fillProgress.phase,
+    processed: fillProgress.processed,
+    total: fillProgress.total,
+    aiAnalyzed: fillProgress.aiAnalyzed,
+    aiTotal: fillProgress.aiTotal,
+    status: status.value
+  })
+}, { flush: 'post' })
+let activeFillRunId = ''
+const processedFillIds = new Set<string>()
 const matchedCount = computed(() => Object.values(resolutions).filter(item => item.status === 'ready' || item.status === 'needs-confirmation').length)
 
 /** 结果报告四分类（F51）：已填写 / 原值保留 / 待确认 / 失败。 */
@@ -117,8 +132,8 @@ const diagnosticFunnel = computed(() => summarizeFunnel(fields.value, resolution
 const knowledgeWatch = ref(false)
 
 const FIELD_REVIEW_TABS = [
-  { id: 'pending', label: '待确认' },
-  { id: 'confirmed', label: '已确认' },
+  { id: 'pending', label: '未填写' },
+  { id: 'confirmed', label: '已匹配' },
   { id: 'filled', label: '已填写' },
   { id: 'failed', label: '填写失败' },
   { id: 'kept', label: '原值保留' },
@@ -131,7 +146,6 @@ type FieldReviewTab = typeof FIELD_REVIEW_TABS[number]['id']
 function fieldReviewBucket(field: FormField): FieldReviewTab {
   const result = results[field.id]
   if (result?.status === 'failed') return 'failed'
-  if (result?.status === 'filled' && result.source === 'ai') return 'pending'
   if (result?.status === 'filled') return 'filled'
   if (result?.status === 'skipped') return 'kept'
   const resolution = resolutions[field.id]
@@ -140,6 +154,12 @@ function fieldReviewBucket(field: FormField): FieldReviewTab {
   if (resolution.status === 'ready') return 'confirmed'
   if (resolution.status === 'skipped') return 'kept'
   return 'empty'
+}
+
+function fieldNeedsAttention(field: FormField): boolean {
+  const result = results[field.id]
+  return result?.status === 'filled' && (result.source === 'ai' || result.needsReview === true
+    || (result.confidence != null && result.confidence < 0.85))
 }
 
 const fieldTabs = computed(() => {
@@ -183,6 +203,13 @@ onMounted(async () => {
   chrome.storage.onChanged.addListener(settingsChanged)
   removeSettingsEvents = () => chrome.storage.onChanged.removeListener(settingsChanged)
   removeContentEvents = onContentEvent(event => {
+    if (event?.type === 'FILL_PROGRESS') {
+      if (event.runId === activeFillRunId && event.result) {
+        results[event.result.fieldId] = event.result
+        updateFillProgress(event.result)
+      }
+      return
+    }
     if (event?.type === 'PAGE_MUTATED') {
       // F16：只提示不动作
       newFieldsHint.value = event.added || 0
@@ -207,6 +234,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopLearnedWatch()
+  if (autoFillRunning.value) {
+    setFillOverlay(null)
+    setPanelBusy(false)
+  }
   removeContentEvents?.()
   removeSettingsEvents?.()
 })
@@ -266,6 +297,7 @@ async function refreshVisualHealth(): Promise<void> {
 function openFillView() { showingControl.value = false; expanded.value = true; resizePanel('expanded') }
 function openCompactView() { showingControl.value = false; expanded.value = false; resizePanel('compact') }
 function dragFromHeader(event: PointerEvent) {
+  if (autoFillRunning.value) return
   if ((event.target as HTMLElement).closest('button, input, textarea, a')) return
   event.preventDefault()
   beginPanelDrag(event.clientX, event.clientY)
@@ -374,50 +406,142 @@ function resolveOne(field: FormField): void {
       : isFamilyField(field) ? familySegmentItem(field) : namedSegmentItem(field),
     legacyWorkFallback: !pageHasSection('internship')
   })
+  const bestLocal = field.slotCandidates?.[0]
+  if (field.slotStatus === 'ambiguous' && bestLocal && bestLocal.slot === resolved.slot && resolved.value) {
+    resolved.confidence = Math.min(resolved.confidence, bestLocal.score, 0.8)
+    resolved.reason = `已选择本地得分最高的字段含义；${resolved.reason}`
+  }
   resolved.diagnostics = resolutionDiagnostics(field, resolved)
   resolutions[field.id] = resolved
   selections[field.id] = resolved.factId && (resolved.status === 'ready' || resolved.status === 'needs-confirmation') ? resolved.factId : ''
 }
 
-/** 未配置 AI 时的选择：去配置 / 立即填充 / 未决定。 */
-const aiPrompt = ref<'pending' | null>(null)
-
 async function autoFill() {
+  if (autoFillRunning.value) return
   autoFillRunning.value = true
+  setPanelBusy(true)
+  activeFillRunId = `fill-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  processedFillIds.clear()
+  Object.assign(fillProgress, { phase: 'scan', processed: 0, total: 0, aiAnalyzed: 0, aiTotal: 0 })
   status.value = '正在准备自动填写…'
   try {
-    aiSettings.value = await loadAiSettings()
-    // 没配置 AI 时先询问：配置后识别更准确，也可以跳过直接按字段名填充
-    if (featureSettings.aiMapping && !aiReady.value) { aiPrompt.value = 'pending'; return }
     await runAutoFill()
+  } catch (error) {
+    status.value = error instanceof Error ? error.message : '自动填写失败。'
   } finally {
+    fillProgress.phase = 'done'
+    setFillOverlay({ phase: 'done', processed: fillProgress.processed, total: fillProgress.total,
+      aiAnalyzed: fillProgress.aiAnalyzed, aiTotal: fillProgress.aiTotal, status: status.value })
+    activeFillRunId = ''
     autoFillRunning.value = false
+    setPanelBusy(false)
   }
 }
 
+function updateFillProgress(result: FillResult): void {
+  if (processedFillIds.has(result.fieldId)) return
+  processedFillIds.add(result.fieldId)
+  fillProgress.processed = [...processedFillIds].filter(id => fields.value.some(field => field.id === id)).length
+}
+
 async function runAutoFill() {
-  // 识别页面 →（已配置 AI 时）分析表单字段含义 → 按知识库匹配 → 填写
+  // 流水线式流式填写：扫描 → 本地已匹配立即填 → AI 分批，每批返回即填，不空等整轮分析。
   // 这一轮写完之前不监测网页修改，避免把填写过程本身学进知识库。
   knowledgeWatch.value = false
   learned.value = []
   dismissedLearned.clear()
-  await scan({ probeOptions: true })
+  if (!await scan({ expandRepeats: false })) return
   if (!fields.value.length) { status.value = '当前页面没有发现可填写的表单字段。'; return }
-  if (featureSettings.aiMapping && aiReady.value) await aiMatch()
-  if (Object.values(selections).some(Boolean)) await fill(undefined, { armKnowledgeWatch: true })
-  else status.value = '没有可填写的字段：知识库中没有与本页字段对应的数据，请先完善「我的信息」。监测尚未开始。'
+
+  fillProgress.phase = 'local'
+  fillProgress.total = fields.value.length
+
+  busy.value = true
+  let filledTotal = 0
+  let failure = ''
+  let aiSummary: AiPassSummary | undefined
+  let firstFill = true
+  const notFilled = (field: FormField) => results[field.id]?.status !== 'filled'
+  const countFilled = (rows: FillResult[]) => rows.filter(row => row.status === 'filled').length
+
+  // 填当前所有已就绪、尚未填过的字段。身份字段写入后重扫长出的重复段。
+  const flushReady = async (fieldIds?: ReadonlySet<string>): Promise<void> => {
+    const targets = () => fields.value.filter(field => notFilled(field) && (!fieldIds || fieldIds.has(field.id)))
+    const values = fillRequests(targets())
+    if (!values.length) return
+    const phases = splitIdentityFillRequests(values, fields.value)
+    if (phases.identity.length) {
+      status.value = `正在先填写 ${phases.identity.length} 个记录身份字段…`
+      filledTotal += countFilled(await sendFillRequests(phases.identity, firstFill))
+      firstFill = false
+      // AI 也可能在第二轮才认出身份字段；每次身份写入后保留 AI 建议并重扫。
+      await refreshAutoFillFields()
+      const rest = fillRequests(targets())
+      if (rest.length) {
+        status.value = `身份字段已填，正在流式填写其余 ${rest.length} 个字段…`
+        filledTotal += countFilled(await sendFillRequests(rest, false))
+      }
+      return
+    }
+    filledTotal += countFilled(await sendFillRequests(values, firstFill))
+    firstFill = false
+  }
+
+  try {
+    await flushReady() // 本地已匹配：立即填
+    if (planRepeatExpansion(fields.value, allFacts.value).length) {
+      status.value = '正在补充页面上的重复经历段…'
+      if (await expandRepeatsIfNeeded()) {
+        await refreshAutoFillFields()
+        await flushReady()
+      }
+    }
+    if (featureSettings.aiMapping) {
+      aiSettings.value = await loadAiSettings()
+    }
+    if (featureSettings.aiMapping && aiReady.value) {
+      fillProgress.phase = 'ai'
+      aiSummary = await aiMatchStreaming(flushReady) // AI 分批：每批返回即填
+    }
+  } catch (error) {
+    failure = error instanceof Error ? error.message : '填写失败。'
+  } finally {
+    busy.value = false
+  }
+
+  knowledgeWatch.value = true
+  learned.value = []
+  const aiNote = aiSummary?.failedBatches ? `AI 有 ${aiSummary.failedBatches} 批失败：${aiSummary.firstError}。` : ''
+  status.value = failure ? `已填写 ${filledTotal} 项；后续步骤失败：${failure}` : filledTotal > 0
+    ? `已流式填写 ${filledTotal} 项。${aiNote}橙色标记为投影或低置信匹配，请留意。正在监测你之后的修改。`
+    : aiSummary?.failedBatches ? `${aiNote}本次没有成功填入字段，仍可重试。正在监测。`
+      : featureSettings.aiMapping && !aiReady.value
+        ? '本地未找到可填写字段；配置 AI 后可补充识别。正在监测。'
+        : '没有可填写的字段：知识库中没有与本页字段对应的数据，请先完善「我的信息」。正在监测。'
 }
 
-function goConfigureAi() {
-  aiPrompt.value = null
-  openControl('settings')
-}
-
-async function fillWithoutAi() {
-  aiPrompt.value = null
-  autoFillRunning.value = true
-  try { await runAutoFill() }
-  finally { autoFillRunning.value = false }
+async function refreshAutoFillFields(): Promise<void> {
+  const again = await requestContent({ type: 'SCAN', probeOptions: false })
+  if (again.error) throw new Error(again.error)
+  const kept = { ...results }
+  const suggested = new Map<string, { fingerprint: string; suggestion: SlotSuggestion }>()
+  for (const field of fields.value) {
+    const suggestion = aiSuggestions[field.id]
+    if (suggestion) suggested.set(field.id, { fingerprint: field.fingerprint, suggestion })
+  }
+  applyScan(again)
+  for (const field of fields.value) {
+    const previous = suggested.get(field.id)
+    if (previous?.fingerprint === field.fingerprint) {
+      aiSuggestions[field.id] = previous.suggestion
+      resolveOne(field)
+    }
+  }
+  for (const [id, row] of Object.entries(kept)) {
+    if (fields.value.some(field => field.id === id)) results[id] = row
+  }
+  fillProgress.total = fields.value.length
+  fillProgress.processed = [...processedFillIds].filter(id => fields.value.some(field => field.id === id)).length
 }
 
 async function startAutoFillFromHome() {
@@ -446,7 +570,7 @@ async function expandRepeatsIfNeeded(): Promise<number> {
   return rows.reduce((sum, row) => sum + (row.count || 0), 0)
 }
 
-async function scan(options: { probeOptions?: boolean } = {}) {
+async function scan(options: { probeOptions?: boolean; expandRepeats?: boolean } = {}): Promise<boolean> {
   busy.value = true
   status.value = '正在读取当前页面…'
   fields.value = []
@@ -455,12 +579,15 @@ async function scan(options: { probeOptions?: boolean } = {}) {
   learned.value = []
   dismissedLearned.clear()
   try {
-    facts.value = tagFacts((await loadProfile()).facts, 'profile')
-    const response = await requestContent({ type: 'SCAN', probeOptions: options.probeOptions === true })
+    const [profile, response] = await Promise.all([
+      loadProfile(),
+      requestContent({ type: 'SCAN', probeOptions: options.probeOptions === true })
+    ])
+    facts.value = tagFacts(profile.facts, 'profile')
     if (response.error) throw new Error(response.error)
     applyScan(response)
     let added = 0
-    if (planRepeatExpansion(fields.value, allFacts.value).length) {
+    if (options.expandRepeats !== false && planRepeatExpansion(fields.value, allFacts.value).length) {
       status.value = '档案里的经历比页面上多，正在补行…'
       added = await expandRepeatsIfNeeded()
       if (added) {
@@ -473,54 +600,147 @@ async function scan(options: { probeOptions?: boolean } = {}) {
     const pending = Object.values(resolutions).filter(item => item.status === 'needs-confirmation').length
     const frames = pageContext.value?.frames?.length || 1
     const addedNote = added ? `已自动补充 ${added} 段。` : ''
-    status.value = `识别 ${fields.value.length} 个字段（${frames > 1 ? `${frames} 个 frame，` : ''}已确认 ${ready} 个，待确认 ${pending} 个）。${addedNote}`
-  } catch (error) { status.value = error instanceof Error ? error.message : '页面识别失败。' }
+    status.value = `识别 ${fields.value.length} 个字段（${frames > 1 ? `${frames} 个 frame，` : ''}可填写 ${ready} 个，未填写 ${pending} 个）。${addedNote}`
+    return true
+  } catch (error) { status.value = error instanceof Error ? error.message : '页面识别失败。'; return false }
   finally { busy.value = false }
 }
 
-/**
- * 二级填充：只把一级还没精确命中的空字段和知识库交给 AI。
- * AI 只能指向已有槽位或已有条目。别名等这次写入成功，或用户确认后再记。
- */
-async function aiMatch() {
-  const pending = fieldsNeedingAi(fields.value, id => resolutions[id]?.status)
-  if (!pending.length) {
-    status.value = '所有空字段都已精确匹配到知识库，无需 AI 分析。'
-    return
+type AiPassSummary = { analyzed: number; matched: number; failedBatches: number; firstError: string }
+
+/** 相同板块的字段放在一起，让每个 AI 请求只携带相关知识。 */
+function aiFieldChunks(pending: FormField[], batchSize = 6): FormField[][] {
+  const groups = new Map<string, FormField[]>()
+  for (const field of pending) {
+    const section = field.sectionId || sectionOfText(field.group) || 'unknown'
+    const group = groups.get(section) || []
+    group.push(field)
+    groups.set(section, group)
   }
-  busy.value = true
-  status.value = `正在让 AI 分析 ${pending.length} 个字段的含义…`
-  try {
-    aiSettings.value = await loadAiSettings()
-    const domain = pageDomain()
-    // 先查缓存（F43）：同站同指纹不重复请求
-    const knownFactIds = new Set(allFacts.value.map(fact => fact.id))
-    const cached = await getCachedSuggestions(domain, pending.map(field => ({ fieldId: field.id, fingerprint: field.fingerprint })), allFacts.value)
-    const cachedIds = new Set(cached.map(item => item.fieldId))
-    const remaining = pending.filter(field => !cachedIds.has(field.id))
-    let fresh: SlotSuggestion[] = []
-    if (remaining.length) {
-      if (!aiReady.value) throw new Error('请先在档案设置中保存 API URL、API Key 和模型名称。')
-      fresh = await suggestSlotMatches(remaining, allFacts.value, aiSettings.value)
-      await putCachedSuggestions(domain, allFacts.value, fresh.flatMap(item => {
-        const field = fields.value.find(candidate => candidate.id === item.fieldId)
-        return field ? [{ fingerprint: field.fingerprint, suggestion: item }] : []
-      }))
-    }
-    let adopted = 0
-    for (const item of [...cached, ...fresh]) {
+  return [...groups.values()].flatMap(group => {
+    const chunks: FormField[][] = []
+    for (let index = 0; index < group.length; index += batchSize) chunks.push(group.slice(index, index + batchSize))
+    return chunks
+  })
+}
+
+function aiFactsForChunk(chunk: FormField[], knowledge: Fact[]): Fact[] {
+  const section = chunk[0]?.sectionId || sectionOfText(chunk[0]?.group || '')
+  if (!section) return knowledge
+  const related = knowledge.filter(fact => {
+    const factSection = sectionOfText(fact.group)
+    return factSection === section || (section === 'work' && factSection === 'internship')
+  })
+  return related.length ? related : knowledge
+}
+
+/** 缓存优先；AI 请求最多两个并发，每批返回即排队校验与写入。 */
+async function aiMatchStreaming(onBatchResolved: (fieldIds: ReadonlySet<string>) => Promise<void>): Promise<AiPassSummary> {
+  const summary: AiPassSummary = { analyzed: 0, matched: 0, failedBatches: 0, firstError: '' }
+  const knowledge = allFacts.value
+  const domain = pageDomain()
+  const knownFactIds = new Set(knowledge.map(fact => fact.id))
+  const visited = new Set<string>()
+  const adopt = (items: SlotSuggestion[]): Set<string> => {
+    const ready = new Set<string>()
+    for (const item of items) {
       const field = fields.value.find(candidate => candidate.id === item.fieldId)
+      if (!field || results[field.id]?.status === 'filled' || field.current.trim()) continue
       const validSlot = item.slot ? slotById(item.slot) : undefined
       const validFact = item.factId ? knownFactIds.has(item.factId) : false
-      if (!field || (!validSlot && !validFact)) continue
+      if (!validSlot && !validFact) continue
       aiSuggestions[field.id] = item
       resolveOne(field)
-      if (resolutions[field.id]?.status === 'ready' || resolutions[field.id]?.status === 'needs-confirmation') adopted += 1
+      if (isPreviewFillable(resolutions[field.id])) ready.add(field.id)
     }
-    const unmatched = pending.length - adopted
-    status.value = `AI 分析完成：${adopted} 个字段已对应到知识库并取到值（其中缓存命中 ${cached.length} 个）${unmatched > 0 ? `，${unmatched} 个字段知识库没有对应数据` : ''}。请核对后点击「填写匹配字段」。`
-  } catch (error) { status.value = error instanceof Error ? error.message : 'AI 匹配失败。' }
-  finally { busy.value = false }
+    summary.matched += ready.size
+    return ready
+  }
+
+  busy.value = true
+  try {
+    // 身份字段经 AI 写入后可能让页面长出新字段；最多补扫一轮。
+    for (let wave = 0; wave < 2; wave += 1) {
+      const pending = fieldsNeedingAi(fields.value, id => resolutions[id]?.status)
+        .filter(field => !visited.has(field.id) && results[field.id]?.status !== 'filled')
+      if (!pending.length) break
+      pending.forEach(field => visited.add(field.id))
+      fillProgress.aiTotal += pending.length
+
+      const cached = await getCachedSuggestions(domain, pending.map(field => ({ fieldId: field.id, fingerprint: field.fingerprint })), knowledge).catch(() => [] as SlotSuggestion[])
+      const cachedIds = new Set(cached.map(item => item.fieldId))
+      if (cached.length) {
+        status.value = `AI 缓存命中 ${cached.length} 个字段，正在填写…`
+        const ready = adopt(cached)
+        if (ready.size) {
+          try { await onBatchResolved(ready) }
+          catch (error) {
+            summary.failedBatches += 1
+            summary.firstError ||= error instanceof Error ? error.message : '写入失败'
+          }
+        }
+        fillProgress.aiAnalyzed += cached.length
+        summary.analyzed += cached.length
+      }
+
+      const remaining = pending.filter(field => !cachedIds.has(field.id))
+      if (!remaining.length) continue
+      if (!aiReady.value) throw new Error('请先在档案设置中保存 API URL、API Key 和模型名称。')
+      const chunks = aiFieldChunks(remaining)
+      const fresh: SlotSuggestion[] = []
+      let cursor = 0
+      let applied = Promise.resolve()
+      const worker = async (): Promise<void> => {
+        while (cursor < chunks.length) {
+          const chunk = chunks[cursor++]
+          try {
+            const suggestions = await suggestSlotMatches(chunk, aiFactsForChunk(chunk, knowledge), aiSettings.value)
+            fresh.push(...suggestions)
+            status.value = `AI 已返回 ${chunk.length} 个字段的分析结果，正在填写…`
+            applied = applied.then(async () => {
+              const ready = adopt(suggestions)
+              if (ready.size) await onBatchResolved(ready)
+            }).catch(error => {
+              summary.failedBatches += 1
+              summary.firstError ||= error instanceof Error ? error.message : '写入失败'
+            }).then(() => {
+              fillProgress.aiAnalyzed += chunk.length
+              summary.analyzed += chunk.length
+              status.value = `AI 已处理 ${fillProgress.aiAnalyzed}/${fillProgress.aiTotal} 个字段。`
+            })
+          } catch (error) {
+            fillProgress.aiAnalyzed += chunk.length
+            summary.analyzed += chunk.length
+            summary.failedBatches += 1
+            summary.firstError ||= error instanceof Error ? error.message : 'AI 分析失败'
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => worker()))
+      await applied
+      if (fresh.length) {
+        await putCachedSuggestions(domain, knowledge, fresh.flatMap(item => {
+          const field = fields.value.find(candidate => candidate.id === item.fieldId)
+          return field ? [{ fingerprint: field.fingerprint, suggestion: item }] : []
+        })).catch(() => undefined)
+      }
+    }
+    // 并发批次可能先识别子选项、后识别父选项；父项写完后只补试一次受选项依赖影响的字段。
+    const retry = new Set(fields.value.filter(field => aiSuggestions[field.id]
+      && results[field.id]?.status === 'failed'
+      && (results[field.id]?.reasonCode === 'no-matching-option'
+        || results[field.id]?.reasonCode === 'option-list-not-found')).map(field => field.id))
+    if (retry.size) {
+      try { await onBatchResolved(retry) }
+      catch (error) {
+        summary.failedBatches += 1
+        summary.firstError ||= error instanceof Error ? error.message : '选项补填失败'
+      }
+    }
+    return summary
+  } finally {
+    busy.value = false
+  }
 }
 
 /** AI 高置信不覆盖用户改过的别名；用户确认时 overwrite。同名多板块只记站点指纹。 */
@@ -571,11 +791,14 @@ async function selectionChanged(field: FormField) {
   }
 }
 
+const PROJECTABLE_CHOICE_KINDS = new Set(['select', 'multiselect', 'cascade', 'combobox'])
+
 function fillRequests(targets: FormField[], onlyFieldId?: string): FillRequest[] {
+  // 绑定分组始终以整页字段计算，保证流式分批多次调用时组内顺序一致。
   const bindings = onlyFieldId
     ? new Map()
-    : planValueBindings(targets, field => selections[field.id] || resolutions[field.id]?.factId)
-  for (const field of targets) {
+    : planValueBindings(fields.value, field => selections[field.id] || resolutions[field.id]?.factId)
+  for (const field of fields.value) {
     const binding = bindings.get(field.id)
     field.valueBinding = binding
       ? { groupId: binding.groupId, shape: binding.shape, index: binding.index, size: binding.size }
@@ -596,13 +819,15 @@ function fillRequests(targets: FormField[], onlyFieldId?: string): FillRequest[]
     const value = fact?.value || resolution?.value
     if (!value || (!binding && !selections[field.id])) return []
     const factSlot = fact ? factToSlot(fact).slot : undefined
+    // 选择类控件一律让写入层按真实选项投影选中最匹配项，而不是把原始值直接打进去。
+    const projectable = Boolean(binding) || PROJECTABLE_CHOICE_KINDS.has(field.kind)
     return [{
       fieldId: field.id,
       value: binding ? value : resolution?.value || value,
       source: resolution?.source === 'empty' ? fact?.source : resolution?.source,
       confidence: resolution?.confidence,
       slot: resolution?.slot || factSlot,
-      valueMode: binding ? 'match-options' : 'literal',
+      valueMode: projectable ? 'match-options' : 'literal',
       bindingGroupId: binding?.groupId,
       dependsOn: binding?.previousFieldId ? [binding.previousFieldId] : undefined
     }]
@@ -654,10 +879,11 @@ function acceptFillResults(rows: FillResult[]): void {
 
 async function sendFillRequests(values: FillRequest[], resetUndo: boolean): Promise<FillResult[]> {
   if (!values.length) return []
-  const response = await requestContent({ type: 'FILL', values, resetUndo })
+  const response = await requestContent({ type: 'FILL', values, resetUndo, runId: activeFillRunId || undefined })
   if (response.error) throw new Error(response.error)
   const rows = response.results as FillResult[]
   acceptFillResults(rows)
+  if (activeFillRunId) rows.forEach(updateFillProgress)
   return rows
 }
 
@@ -686,13 +912,12 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
       rows.push(...identityRows)
 
       status.value = '身份字段已填写，正在等待页面更新并重新识别…'
-      const again = await requestContent({ type: 'SCAN', probeOptions: true })
+      const again = await requestContent({ type: 'SCAN', probeOptions: false })
       if (again.error) throw new Error(again.error)
       applyScan(again)
       for (const result of identityRows) {
         if (fields.value.some(field => field.id === result.fieldId)) results[result.fieldId] = result
       }
-      if (featureSettings.aiMapping && aiReady.value) await aiMatch()
       busy.value = true
       targets = fields.value
       counts = resolutionCounts(targets)
@@ -711,7 +936,7 @@ async function fill(onlyFieldId?: string, options?: { armKnowledgeWatch?: boolea
       learned.value = []
     }
     const watchNote = options?.armKnowledgeWatch ? '填写已完成，正在监测你之后在网页上的修改。' : ''
-    status.value = `已填写 ${filled} 项，原值保留 ${kept} 项，失败 ${failed} 项${counts.pending ? `；${counts.pending} 个字段仍待确认（候选冲突或选项需核对）` : ''}${counts.empty ? `；${counts.empty} 个字段知识库无数据` : ''}。${watchNote}低置信匹配已用橙色标记，请在「核对匹配」中确认后再提交。`
+    status.value = `已填写 ${filled} 项，原值保留 ${kept} 项，失败 ${failed} 项${counts.pending ? `；${counts.pending} 个字段仍无法填写` : ''}${counts.empty ? `；${counts.empty} 个字段知识库无数据` : ''}。${watchNote}低置信匹配已用橙色标记。`
   } catch (error) { status.value = error instanceof Error ? error.message : '填写失败。' }
   finally { busy.value = false }
 }
@@ -1064,7 +1289,7 @@ async function cancelPicker() {
 async function confirmAiField(fieldId: string) {
   const response = await requestContent({ type: 'CONFIRM_FIELD', fieldId })
   if (response?.status === 'confirmed') {
-    if (results[fieldId]) results[fieldId] = { ...results[fieldId], source: 'manual' }
+    if (results[fieldId]) results[fieldId] = { ...results[fieldId], source: 'manual', needsReview: false }
     const field = fields.value.find(item => item.id === fieldId)
     const slot = resolutions[fieldId]?.slot || field?.slot
     if (field && slot) rememberFieldMapping(field, slot, pageDomain(), true)
@@ -1127,9 +1352,11 @@ function fieldStateChip(field: FormField): { text: string; tone: 'ok' | 'warn' |
   const bucket = fieldReviewBucket(field)
   const confidence = resolutions[field.id]?.confidence
   const percent = confidence ? ` ${Math.round(confidence * 100)}%` : ''
-  if (bucket === 'pending') return { text: `待确认${percent}`, tone: 'warn' }
-  if (bucket === 'confirmed') return { text: `已确认${percent}`, tone: 'ok' }
-  if (bucket === 'filled') return { text: `已填写${percent}`, tone: 'ok' }
+  if (bucket === 'pending') return { text: `未填写${percent}`, tone: 'warn' }
+  if (bucket === 'confirmed') return { text: `已匹配${percent}`, tone: 'ok' }
+  if (bucket === 'filled') return fieldNeedsAttention(field)
+    ? { text: `已填写·请留意${percent}`, tone: 'warn' }
+    : { text: `已填写${percent}`, tone: 'ok' }
   if (bucket === 'failed') return { text: '填写失败', tone: 'warn' }
   if (bucket === 'kept') return { text: '原值保留', tone: 'muted' }
   if (field.slotStatus === 'ambiguous') return { text: '语义模糊', tone: 'warn' }
@@ -1327,19 +1554,19 @@ async function exportDiagnostics(): Promise<void> {
       <p v-if="newFieldsHint" class="picker-notice">页面出现 {{ newFieldsHint }} 个新字段。<button @click="scan()">重新识别</button></p>
       <p v-if="pickerActive" class="picker-notice">请点击网页中的目标输入框。<button @click="cancelPicker">取消</button></p>
       <p class="panel-status" role="status">{{ status }}</p>
-      <div class="panel-action-row"><button class="panel-primary" :disabled="busy" @click="fill()">填写匹配字段</button><button :disabled="busy || !fields.length || !featureSettings.aiMapping" :title="aiReady ? '让 AI 读懂表单每个字段在问什么，再按知识库取值（值仍经校验）' : '请先配置 AI'" @click="aiMatch">AI 分析表单</button><button @click="undo">撤销</button></div>
+      <div class="panel-action-row"><button class="panel-primary" :disabled="busy || autoFillRunning" @click="autoFill">两轮自动填写</button><button @click="undo">撤销</button></div>
 
       <section v-if="report.filled.length || report.kept.length || report.failed.length" class="panel-section">
-        <div class="panel-section-title"><h2>填写结果</h2><small>已填写 {{ report.filled.length }} · 原值保留 {{ report.kept.length }} · 待确认 {{ report.pending.length }} · 失败 {{ report.failed.length }}</small></div>
+        <div class="panel-section-title"><h2>填写结果</h2><small>已填写 {{ report.filled.length }} · 原值保留 {{ report.kept.length }} · 未填写 {{ report.pending.length }} · 失败 {{ report.failed.length }}</small></div>
       </section>
 
       <section v-if="fields.length" class="panel-section field-list">
-        <div class="panel-section-title"><h2>网页字段（{{ fields.length }}）</h2><small>按待确认、已确认、填写结果和置信度状态切换</small></div>
+        <div class="panel-section-title"><h2>网页字段（{{ fields.length }}）</h2><small>按匹配、填写结果和置信度状态切换</small></div>
         <div class="field-tabs" role="tablist">
           <button v-for="tab in fieldTabs" :key="tab.id" type="button" role="tab" :class="{ active: activeTab?.id === tab.id }" :aria-selected="activeTab?.id === tab.id" @click="activeFieldTab = tab.id">{{ tab.label }} <em>{{ tab.rows.length }}</em></button>
         </div>
         <template v-if="activeTab">
-          <div v-for="field in activeTab.rows" :key="field.id" :class="['field-card', { 'needs-confirmation': fieldReviewBucket(field) === 'pending' }]">
+          <div v-for="field in activeTab.rows" :key="field.id" :class="['field-card', { 'needs-confirmation': fieldReviewBucket(field) === 'pending' || fieldNeedsAttention(field) }]">
             <div class="field-title">
               <strong>{{ field.label || field.placeholder || '未命名字段' }}</strong>
               <span class="tag">{{ field.kind }}</span>
@@ -1354,7 +1581,6 @@ async function exportDiagnostics(): Promise<void> {
             <button class="assist-one" :disabled="busy || !selections[field.id]" @click="manualFill(field)">填入此字段</button>
             <small v-if="results[field.id]" :class="resultTone(results[field.id])">{{ resultDetail(results[field.id]) }}</small>
             <button v-if="results[field.id]?.status === 'failed'" class="assist-one" :disabled="busy" @click="fill(field.id)">重试该字段</button>
-            <button v-if="results[field.id]?.status === 'filled' && results[field.id]?.source === 'ai'" class="confirm-match" @click="confirmAiField(field.id)">确认匹配并恢复正常高亮</button>
           </div>
         </template>
       </section>
@@ -1363,17 +1589,6 @@ async function exportDiagnostics(): Promise<void> {
     </div>
   </main>
   <OptionsApp v-else :key="controlView" embedded :initial-view="controlView" @auto-fill="startAutoFillFromHome" @collapse="openCompactView" @fill-fact="manualFillFact" @deactivated="onLicenseCleared" />
-  <div v-if="aiPrompt === 'pending'" class="ai-prompt-mask">
-    <div class="ai-prompt" role="dialog" aria-labelledby="ai-prompt-title">
-      <h2 id="ai-prompt-title">建议先配置 AI</h2>
-      <p>配置 AI 服务后，插件能读懂表单字段的不同说法（如「名字」对应「姓名」）并按填写要求调整内容，识别和填写会更准确。</p>
-      <p>不配置也可以立即填写，但只会按字段名精确匹配知识库。</p>
-      <div class="ai-prompt-actions">
-        <button class="panel-primary" @click="goConfigureAi">去配置</button>
-        <button @click="fillWithoutAi">不配置，立即填充</button>
-      </div>
-    </div>
-  </div>
   </template>
 </template>
 

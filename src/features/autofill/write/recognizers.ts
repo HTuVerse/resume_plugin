@@ -21,7 +21,13 @@ export function splitCascadeValue(value: string): string[] {
   const bySpace = trimmed.split(/\s+/).map(item => item.trim()).filter(Boolean)
   if (bySpace.length > 1 && bySpace.length <= 4 && bySpace.every(part => part.length >= 2 && part.length <= 20)) return bySpace
   const byRegion = trimmed.match(/[^省市区县旗盟]+?(?:省|市|区|县|旗|盟|自治区|自治州|自治县)/g)
-  if (byRegion && byRegion.length > 1) return byRegion.map(item => item.trim())
+  if (byRegion && byRegion.length) {
+    // 连写行政区可能末级缺后缀（江西省吉安市永丰），把被带后缀部分消费掉之后的剩余作为末级补上。
+    const consumed = byRegion.join('')
+    const rest = trimmed.startsWith(consumed) ? trimmed.slice(consumed.length).trim() : ''
+    const parts = (rest && rest.length >= 2 ? [...byRegion, rest] : byRegion).map(item => item.trim())
+    if (parts.length > 1) return parts
+  }
   return [trimmed]
 }
 
@@ -36,13 +42,13 @@ function realOptions(nodes: HTMLElement[]): HTMLElement[] {
   })
 }
 
-type OptionPick = { status: 'found'; node: HTMLElement } | { status: 'missing' } | { status: 'ambiguous' }
+type OptionPick = { status: 'found'; node: HTMLElement; weak?: boolean } | { status: 'missing' }
 
 function pickOption(nodes: HTMLElement[], value: string): OptionPick {
   const match = matchOption(nodes.map(optionText), value)
-  if (match.ambiguous) return { status: 'ambiguous' }
   if (match.index < 0 || !nodes[match.index]) return { status: 'missing' }
-  return { status: 'found', node: nodes[match.index] }
+  // 并列最高分时按选项原顺序选择第一个，并用橙色提示。
+  return { status: 'found', node: nodes[match.index], weak: match.reason === 'prefix' || match.ambiguous }
 }
 
 /**
@@ -59,13 +65,13 @@ async function stepThroughOptions(
 ): Promise<WriteAttempt> {
   const levels = splitCascadeValue(value)
   let host = scope
+  let weak = false
   const nodesNow = () => realOptions(popupOptions(host.isConnected ? host : document.body))
   const full = pickOption(nodesNow(), value)
-  if (full.status === 'ambiguous') return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
   if (full.status === 'found') {
     await activateElement(full.node, trusted)
     await wait(120)
-    return { applied: true }
+    return { applied: true, viaProjection: Boolean(full.weak) }
   }
   if (levels.length <= 1 && !projectWholeValue) return { applied: false, reasonCode: 'no-matching-option' }
 
@@ -84,8 +90,7 @@ async function stepThroughOptions(
     let picked = pickOption(pool, target)
     if (picked.status === 'missing' && projectWholeValue) {
       const projected = projectOptionFromValue(pool.map(optionText), value, selectedTexts)
-      if (projected?.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '当前层存在多个可投影选项' }
-      if (projected && pool[projected.index]) picked = { status: 'found', node: pool[projected.index] }
+      if (projected && pool[projected.index]) { picked = { status: 'found', node: pool[projected.index], weak: true } }
     }
     if (picked.status === 'missing' && allowSearch && input && !input.readOnly) {
       if (!trusted || !await trustedReplaceText(input, target)) setNativeText(input, target)
@@ -94,20 +99,19 @@ async function stepThroughOptions(
       picked = pickOption(searchedPool, target)
       if (picked.status === 'missing' && projectWholeValue) {
         const projected = projectOptionFromValue(searchedPool.map(optionText), value, selectedTexts)
-        if (projected?.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '当前层存在多个可投影选项' }
-        if (projected && searchedPool[projected.index]) picked = { status: 'found', node: searchedPool[projected.index] }
+        if (projected && searchedPool[projected.index]) { picked = { status: 'found', node: searchedPool[projected.index], weak: true } }
       }
     }
-    if (picked.status === 'ambiguous') return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
     if (picked.status !== 'found') {
       return { applied: false, reasonCode: 'no-matching-option', detail: `第 ${level + 1} 级找不到唯一匹配` }
     }
+    if (picked.weak) weak = true
     previousTexts = nodesNow().map(optionText)
     selectedTexts.push(optionText(picked.node))
     await activateElement(picked.node, trusted)
     if (levels.length > 1 && level === levels.length - 1) {
       await wait(120)
-      return { applied: true }
+      return { applied: true, viaProjection: weak }
     }
     const transition = await pollUntil<{ status: 'next'; host: HTMLElement } | { status: 'done' } | null>(() => {
       if (!host.isConnected || !isElementVisible(host)) return { status: 'done' }
@@ -116,14 +120,14 @@ async function stepThroughOptions(
       if (!texts.length || texts.join('\n') === previousTexts.join('\n')) return null
       return { status: 'next', host: current }
     }, 1500)
-    if (transition?.status === 'done' && projectWholeValue) return { applied: true }
+    if (transition?.status === 'done' && projectWholeValue) return { applied: true, viaProjection: weak }
     if (!transition) {
       return { applied: false, reasonCode: 'option-list-not-found', detail: '下一级未出现' }
     }
     if (transition.status === 'done') return { applied: false, reasonCode: 'option-list-not-found', detail: '下一级未出现' }
     host = transition.host
   }
-  return { applied: true }
+  return { applied: true, viaProjection: weak }
 }
 
 /**
@@ -143,6 +147,8 @@ export interface WriteAttempt {
   applied: boolean
   reasonCode?: FillReasonCode
   detail?: string
+  /** 命中的选项来自模糊投影 / 前缀匹配，而非精确或同义命中，需用户复核。 */
+  viaProjection?: boolean
 }
 
 export interface ControlRecognizer {
@@ -279,7 +285,7 @@ const nativeSelectRecognizer: ControlRecognizer = {
       const levels = splitCascadeValue(value)
       const hidden = selectIsHidden(select)
       const list = hidden ? listsBesideSelect(select).find(item => realOptions(popupOptions(item)).length) : undefined
-      if (levels.length > 1 && list) return stepThroughOptions(list, value, null)
+      if (levels.length > 1 && list) return stepThroughOptions(list, value, null, false, true, true)
       return { applied: false, reasonCode: 'no-matching-option' }
     }
     const option = options[match.index]
@@ -288,7 +294,7 @@ const nativeSelectRecognizer: ControlRecognizer = {
     setNativeSelect(select, option.value)
     revealHiddenSelectOption(select, option.text)
     if (ctx.ref.kind === 'cascade') await wait(200) // 等待级联下一级刷新
-    return { applied: true }
+    return { applied: true, viaProjection: match.reason === 'prefix' }
   },
   async restore(ctx, previous) {
     const select = ctx.ref.element as HTMLSelectElement
@@ -349,7 +355,7 @@ function listsBesideSelect(select: HTMLSelectElement): HTMLElement[] {
 function clickMatchingItem(list: HTMLElement, label: string): boolean {
   const items = Array.from(list.querySelectorAll<HTMLElement>('li,[role="option"]'))
   const match = matchOption(items.map(item => item.textContent?.trim() || ''), label)
-  if (match.index < 0 || match.ambiguous || !items[match.index]) return false
+  if (match.index < 0 || !items[match.index]) return false
   clickElement(items[match.index])
   return true
 }
@@ -427,17 +433,17 @@ const choiceRecognizer: ControlRecognizer = {
       const nodes: HTMLElement[] = radios.length ? radios : choices
       const labels = nodes.map(node => optionLabel(node))
       const match = matchOption(labels, value)
-      if (match.index < 0 || match.ambiguous || !nodes[match.index]) {
+      if (match.index < 0 || !nodes[match.index]) {
         return { applied: false, reasonCode: 'no-matching-option' }
       }
       const target = nodes[match.index]
-      if (target instanceof HTMLInputElement) return { applied: activateRadio(target) }
+      if (target instanceof HTMLInputElement) return { applied: activateRadio(target), viaProjection: Boolean(match.ambiguous || match.reason === 'prefix') }
       clickElement(target)
       target.setAttribute(target.hasAttribute('aria-pressed') ? 'aria-pressed' : 'aria-checked', 'true')
       for (const other of nodes) {
         if (other !== target) other.setAttribute(other.hasAttribute('aria-pressed') ? 'aria-pressed' : 'aria-checked', 'false')
       }
-      return { applied: true }
+      return { applied: true, viaProjection: Boolean(match.ambiguous || match.reason === 'prefix') }
     }
     const checkboxes: HTMLElement[] = [...(ref.checkboxes || []), ...(ref.choices || [])]
     if (!checkboxes.length) checkboxes.push(ref.element)
@@ -835,33 +841,40 @@ async function selectCustomValue(trigger: HTMLElement, value: string, trusted = 
     const popup = alreadyOpen || await watch.locate()
     if (!popup) return { applied: false, reasonCode: 'option-list-not-found' }
 
-    if (!allowProjection && shouldStepCascade(value)) {
+    // 多级值（省市区或带分隔符）始终逐级点击。开启投影时每层用 projectOptionFromValue 做模糊匹配，
+    // 不再因为 allowProjection 而被旁路成扁平投影，避免省市区选错。
+    if (shouldStepCascade(value)) {
       if (!realOptions(popupOptions(popup)).length) return { applied: false, reasonCode: 'option-list-not-found', detail: '选项尚未出现' }
-      return stepThroughOptions(popup, value, input, trusted, capabilities?.canSearch !== false)
+      return stepThroughOptions(popup, value, input, trusted, capabilities?.canSearch !== false, allowProjection)
     }
 
     const tryVisible = async (): Promise<WriteAttempt | null> => {
       const options = popupOptions(popup)
       const texts = options.map(option => optionText(option))
       const match = matchOption(texts, value)
-      if (match.index >= 0 && !match.ambiguous) {
+      if (match.index >= 0) {
         const option = options[match.index]
         option.scrollIntoView?.({ block: 'nearest' })
         await activateElement(option, trusted)
-        return { applied: true }
+        return { applied: true, viaProjection: match.reason === 'prefix' || Boolean(match.ambiguous) }
       }
-      if (match.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个匹配' }
       if (allowProjection) {
         const projected = projectOptionFromValue(texts, value)
-        if (projected?.ambiguous) return { applied: false, reasonCode: 'no-matching-option', detail: '选项存在多个可投影匹配' }
         if (projected && options[projected.index]) {
           const option = options[projected.index]
           option.scrollIntoView?.({ block: 'nearest' })
           await activateElement(option, trusted)
-          return { applied: true }
+          return { applied: true, viaProjection: projected.reason === 'projection' || projected.ambiguous }
         }
       }
       return null
+    }
+
+    let searchDirtied = false
+    const clearSearch = async (): Promise<void> => {
+      // 自由输入型下拉没选中选项时会把搜索词当成值留下来，失败前必须清空，避免“把原始值打上去”。
+      if (!searchDirtied || !input || input.readOnly) return
+      if (!trusted || !await trustedReplaceText(input, '')) setNativeText(input, '')
     }
 
     let visible = await tryVisible()
@@ -873,6 +886,7 @@ async function selectCustomValue(trigger: HTMLElement, value: string, trusted = 
       for (const filter of filters) {
         const before = optionSignature(popup)
         if (!trusted || !await trustedReplaceText(input, filter)) setNativeText(input, filter)
+        searchDirtied = true
         await waitForOptionsStable(popup, before)
         visible = await tryVisible()
         if (visible) { if (visible.applied) await wait(120); return visible }
@@ -896,6 +910,7 @@ async function selectCustomValue(trigger: HTMLElement, value: string, trusted = 
         if (stalledRounds >= 2) break
       }
     }
+    await clearSearch()
     return { applied: false, reasonCode: 'no-matching-option' }
   } finally {
     watch.dispose()
@@ -906,13 +921,15 @@ async function writeCustomSelection(ctx: ControlContext, value: string, trusted 
   const trigger = ctx.ref.element
   const requested = ctx.ref.kind === 'multiselect' ? splitMulti(value) : [value.trim()]
   if (!requested.length || requested.some(item => !item)) return { applied: false, reasonCode: 'no-matching-option' }
+  let viaProjection = false
   for (const item of requested) {
     const result = await selectCustomValue(trigger, item, trusted, ctx.ref.control?.capabilities, ctx.request?.valueMode === 'match-options')
     if (!result.applied) return result
+    if (result.viaProjection) viaProjection = true
     // 组件可能在每次选择后关闭浮层；下一项重新从 visiblePopupFor 开始判断。
     if (requested.length > 1) await wait(100)
   }
-  return { applied: true }
+  return { applied: true, viaProjection }
 }
 
 const comboboxRecognizer: ControlRecognizer = {

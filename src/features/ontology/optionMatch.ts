@@ -20,7 +20,7 @@ export type OptionMatchReason = 'exact' | 'synonym' | 'ordered' | 'prefix'
 export interface OptionMatchResult {
   index: number
   reason?: OptionMatchReason
-  /** ≥2 个候选时为 true：不得自动选第一个，转待确认。 */
+  /** ≥2 个候选并列最高分时为 true；写入后用提示颜色标记。 */
   ambiguous?: boolean
 }
 

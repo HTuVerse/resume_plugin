@@ -1,7 +1,7 @@
 {
   "name": "hongtu-resume-autofill-extension",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.3.0",
   "type": "module",
   "scripts": {
     "prepare:ocr": "node scripts/prepare-ocr-assets.mjs",

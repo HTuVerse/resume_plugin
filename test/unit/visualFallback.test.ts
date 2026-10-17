@@ -12,7 +12,7 @@ afterEach(() => {
 describe('视觉填写降级', () => {
   it('浏览器内 OCR 与视觉 AI 状态会在批量开始时预热', async () => {
     vi.stubGlobal('chrome', { runtime: { sendMessage: vi.fn().mockResolvedValue({ ocrAvailable: true, aiAvailable: true, ok: true }) } })
-    await expect(warmupVisualAssist()).resolves.toEqual({ ready: true, ocrAvailable: true, aiAvailable: true, error: undefined })
+    await expect(warmupVisualAssist()).resolves.toEqual({ ready: true, ocrAvailable: true, aiAvailable: true, aiVerified: false, aiRejected: false, aiTestedAt: undefined, error: undefined })
   })
 
   it('本地 OCR 未启动时保留 DOM 失败原因并给出明确提示', async () => {

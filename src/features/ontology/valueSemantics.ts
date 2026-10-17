@@ -2,6 +2,7 @@ import type { SlotDef } from '../../domain/slots'
 import type { FormField } from '../../domain/types'
 import { normalize } from '../../shared/normalize'
 import { sameValue } from './synonyms'
+import { optionEquivalent } from './optionMatch'
 import { compareProjectedSequence } from '../autofill/valueProjection'
 
 /**
@@ -90,6 +91,15 @@ export function compareSemanticValues(existing: string, observed: string, contex
   if (slot?.valueType === 'url') return normalizedUrl(left) === normalizedUrl(right) ? 'equal' : 'different'
   if (field?.kind === 'multiselect' || field?.kind === 'checkbox') {
     return JSON.stringify(collectionValues(left)) === JSON.stringify(collectionValues(right)) ? 'equal' : 'different'
+  }
+  // 级联：按投影序列比较，知识原值（江西省吉安市永丰县）与页面逐级选中的显示（江西/吉安/永丰）视为一致。
+  if (field?.kind === 'cascade') {
+    const relation = compareProjectedSequence(left, right)
+    if (relation !== 'different') return relation
+  }
+  // 下拉/组合框/单选：选项同义或有序等级等价（学士↔本科）即视为一致，避免投影填写后被当成“修正”重复入库。
+  if (field?.kind === 'select' || field?.kind === 'combobox' || field?.kind === 'radio') {
+    if (optionEquivalent(left, right)) return 'equal'
   }
 
   const aliasLeft = slotAliasValue(slot, left)

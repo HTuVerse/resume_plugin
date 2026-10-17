@@ -5,6 +5,7 @@ import { sectionOfText } from '../ontology/sections'
 import { factToSlot, indexFactsBySlot } from './match/factToSlot'
 import { gateValue } from './match/join'
 import { mergeFactsByPriority } from './factPriority'
+import { hasUnresolvedSubject, subjectSectionOf } from './match/subjectScope'
 
 /**
  * 槽位连接 + 校验闸门（重写版，TECH_DESIGN §15）。
@@ -39,9 +40,9 @@ export function buildFactIndex(profileFacts: Fact[], resumeFacts: Fact[] = []): 
 export interface ResolveOptions {
   /** 用户显式开启自动填写的敏感槽位 ID 集合（F54）。 */
   enabledSensitiveSlots?: Set<string>
-  /** AI 仲裁建议，仍需过闸门；低置信结果会先预填并标记为待确认。 */
+  /** AI 仲裁建议仍需过值域与控件校验；置信率只影响提示颜色。 */
   aiSuggestion?: SlotSuggestion
-  /** AI 自动填写匹配阈值（0–100）。达到且闸门通过 → ready，否则待确认。默认 85。 */
+  /** AI 低置信提示阈值（0–100），不阻止写入。默认 85。 */
   aiMatchThreshold?: number
   /**
    * 家庭关系按称谓对齐后的知识库条目。
@@ -56,13 +57,12 @@ export interface ResolveOptions {
 }
 
 /**
- * 可先写入网页、但仍需用户在核对界面确认的结果。
- * 目前只包含已通过值域/控件闸门、仅因 AI 置信度低于阈值而待确认的结果。
+ * 已得到可写值的解析结果立即尝试写入；低置信和弱转换由高亮提示。
+ * 没有值或未通过硬校验的字段不会进入写入层。
  */
 export function isPreviewFillable(resolved: ResolvedField | undefined): boolean {
   return resolved?.status === 'ready'
     || (resolved?.status === 'needs-confirmation'
-      && resolved.reasonCode === 'ai-suggested'
       && Boolean(resolved.value.trim()))
 }
 
@@ -72,7 +72,7 @@ function candidateOf(field: FormField, fact: Fact, reason: string): FieldCandida
     factId: fact.id,
     value: fact.value,
     source: fact.source === 'profile' ? 'profile' : 'resume',
-    confidence: fact.source === 'profile' ? 0.95 : 0.9,
+    confidence: Math.min(fact.source === 'profile' ? 0.95 : 0.9, fact.confidence ?? 1),
     reason,
     evidence: fact.evidence
   }
@@ -82,8 +82,8 @@ function empty(field: FormField, reason: string, reasonCode: ResolvedField['reas
   return { fieldId: field.id, value: '', source: 'empty', confidence: 0, reason, candidates, status: 'empty', reasonCode, slot: field.slot }
 }
 
-function pickFactsForItem(field: FormField, facts: Fact[], segmentItem?: number | null): Fact[] {
-  const repeatable = field.slot ? slotById(field.slot)?.repeatable : false
+function pickFactsForItem(field: FormField, slot: string, facts: Fact[], segmentItem?: number | null): Fact[] {
+  const repeatable = slotById(slot)?.repeatable || false
   if (repeatable && segmentItem === null) return []
   const item = segmentItem || field.item
   if (repeatable && item) {
@@ -119,24 +119,26 @@ function gatedResolution(field: FormField, fact: Fact, slot: string | undefined,
       reason: gate.reason, candidates, status: 'needs-confirmation', reasonCode: gate.reasonCode, slot
     }
   }
-  const confidence = viaAi ? Math.min(1, Math.max(0, aiConfidence)) : 0.95
+  const confidence = viaAi
+    ? Math.min(1, Math.max(0, aiConfidence), fact.confidence ?? 1)
+    : Math.min(0.95, fact.confidence ?? 1)
+  const shownConfidence = gate.needsConfirmation ? Math.min(confidence, 0.8) : confidence
   const adaptedNote = adaptedValue ? `，已按表单要求从「${fact.value}」截取` : ''
-  // 高置信且闸门不要求确认才自动填；低于阈值或同义选项转换仍待确认
-  const autoFill = !gate.needsConfirmation && (!viaAi || confidence * 100 >= aiMatchThreshold)
+  const lowConfidence = viaAi && confidence * 100 < aiMatchThreshold
   return {
     fieldId: field.id,
     factId: fact.id,
     value: gate.value,
     source: viaAi ? 'ai' : 'profile',
-    confidence,
+    confidence: shownConfidence,
     reason: gate.needsConfirmation
       ? gate.reason
       : viaAi
-        ? `AI 匹配知识库「${fact.key}」（置信度 ${Math.round(confidence * 100)}%${autoFill ? '' : `，低于阈值 ${aiMatchThreshold}%`}）${adaptedNote}`
+        ? `AI 匹配知识库「${fact.key}」（置信度 ${Math.round(confidence * 100)}%${lowConfidence ? '，已用橙色提示' : ''}）${adaptedNote}`
         : `匹配槽位「${slotDef?.aliases[0] || slot}」`,
     candidates,
-    status: autoFill ? 'ready' : 'needs-confirmation',
-    reasonCode: gate.needsConfirmation ? gate.reasonCode : (viaAi && !autoFill ? 'ai-suggested' : undefined),
+    status: 'ready',
+    reasonCode: gate.needsConfirmation ? gate.reasonCode : (lowConfidence ? 'ai-suggested' : undefined),
     slot
   }
 }
@@ -145,17 +147,19 @@ function gatedResolution(field: FormField, fact: Fact, slot: string | undefined,
 function resolveCustomField(field: FormField, index: FactIndex, segmentItem?: number | null): ResolvedField | null {
   const labelKey = normalize(field.label)
   if (!labelKey) return null
-  const facts = index.byCustomKey.get(labelKey) || []
+  const subjectSection = subjectSectionOf(field)
+  const facts = (index.byCustomKey.get(labelKey) || []).filter(fact => !subjectSection || sectionOfText(fact.group) === subjectSection)
   if (!facts.length) return null
+  if (!subjectSection && new Set(facts.map(fact => sectionOfText(fact.group))).size > 1) return null
   if (segmentItem === null) return null
   const targetItem = segmentItem || field.item
-  const section = field.sectionId || sectionOfText(field.group)
+  const section = subjectSection
   if (nameAlignedSection(section) && !targetItem) return null
   const sameItem = targetItem ? facts.filter(fact => Math.max(1, fact.item || 1) === targetItem) : []
   // 重复段字段不能在同段缺值时退回其它段，否则父亲/母亲、不同经历会互相串写。
   if (targetItem && !sameItem.length) return null
   const matched = targetItem ? sameItem : facts
-  const preferred = matched.find(fact => fact.source === 'profile') || matched[0]
+  const preferred = [...matched].sort((left, right) => (right.confidence ?? 0.95) - (left.confidence ?? 0.95))[0]
   const gate = gateValue(undefined, field, preferred.value)
   if (!gate.ok) return null
   return {
@@ -163,7 +167,7 @@ function resolveCustomField(field: FormField, index: FactIndex, segmentItem?: nu
     factId: preferred.id,
     value: gate.value,
     source: preferred.source === 'profile' ? 'profile' : 'resume',
-    confidence: 0.95,
+    confidence: Math.min(0.95, preferred.confidence ?? 1),
     reason: `按字段名「${field.label.trim()}」精确匹配到自定义信息`,
     candidates: matched.map(fact => candidateOf(field, fact, '自定义字段名全等匹配')),
     status: 'ready',
@@ -196,14 +200,25 @@ export function resolveField(field: FormField, index: FactIndex, options: Resolv
     return { fieldId: field.id, value: field.current, source: 'empty', confidence: 1, reason: '网页已有内容，默认不覆盖', candidates: [], status: 'skipped', reasonCode: 'skipped-existing', slot: field.slot }
   }
 
+  const subjectSection = subjectSectionOf(field)
+  if (hasUnresolvedSubject(field)) {
+    return empty(field, '同名字段属于多个主体，页面没有足够的主体线索', 'ambiguous-slot')
+  }
+
   // 1. 确定槽位：本地精确命中 → AI 建议（仍走闸门）→ 无
   const proposed = options.aiSuggestion?.fieldId === field.id ? options.aiSuggestion : undefined
   const proposedSlot = proposed?.slot && slotById(proposed.slot) ? proposed.slot : undefined
-  // 一级本地槽位是确定性结论；二级 AI 只补漏，不能覆盖为别的语义。
-  const suggestion = field.slot && proposedSlot && field.slot !== proposedSlot ? undefined : proposed
-  let slot = field.slot
-  let viaAi = Boolean(suggestion)
-  if (!slot && proposedSlot && suggestion) {
+  const proposedFact = proposed?.factId ? index.merged.find(fact => fact.id === proposed.factId) : undefined
+  const localSlot = field.slot && (!subjectSection || slotById(field.slot)?.section === subjectSection) ? field.slot : undefined
+  const scopedProposed = proposed
+    && (!proposedSlot || !subjectSection || slotById(proposedSlot)?.section === subjectSection)
+    && (!proposed?.factId || Boolean(proposedFact && (!subjectSection || sectionOfText(proposedFact.group) === subjectSection)))
+    ? proposed : undefined
+  // 已确定的本地槽位不可被 AI 改写；本地歧义时允许 AI 从候选中改选。
+  const suggestion = localSlot && field.slotStatus !== 'ambiguous' && proposedSlot && localSlot !== proposedSlot ? undefined : scopedProposed
+  let slot = field.slotStatus === 'ambiguous' && suggestion ? proposedSlot : localSlot
+  const viaAi = Boolean(suggestion)
+  if (proposedSlot && suggestion && (!slot || field.slotStatus === 'ambiguous')) {
     slot = proposedSlot
   }
   const threshold = options.aiMatchThreshold ?? 85
@@ -231,7 +246,7 @@ export function resolveField(field: FormField, index: FactIndex, options: Resolv
       return empty(field, '无法确定该字段属于哪一段，为避免重复填写已留空', undefined)
     }
     const segmentMismatch = Boolean(cited && targetItem && citedItem !== targetItem)
-    if (cited && !semanticConflict && !segmentMismatch) {
+    if (cited && (!subjectSection || citedSection === subjectSection) && !semanticConflict && !segmentMismatch) {
       // 只要条目或粒度来自二级 AI，就必须遵守 AI 自动填写阈值。
       return gatedResolution(field, cited, slot, suggestion.adaptedValue, candidatesOfCited(field, cited), true, suggestion.confidence, threshold)
     }
@@ -252,25 +267,28 @@ export function resolveField(field: FormField, index: FactIndex, options: Resolv
   if (!slotFacts.length && options.legacyWorkFallback && slot.startsWith('work.')) {
     slotFacts = index.bySlot.get(`internship.${slot.slice('work.'.length)}`) || []
   }
-  const matched = pickFactsForItem(field, slotFacts, segmentItem)
+  const matched = pickFactsForItem(field, slot, slotFacts, segmentItem)
   if (!matched.length) {
     return empty(field, '档案中没有该槽位的数据', undefined)
   }
 
   const candidates = matched.map(fact => candidateOf(field, fact, viaAi ? 'AI 判定语义 + 档案数据' : '本地语义匹配'))
 
-  // 4. 多个不同取值 → 待确认，不猜
+  // 4. 同一槽位有多个值时选置信率最高的知识库条目；同分沿用知识库顺序。
   const distinctValues = new Set(matched.map(fact => fact.value.trim()))
-  const preferred = matched.find(fact => fact.source === 'profile') || matched[0]
-  if (distinctValues.size > 1) {
-    return {
-      fieldId: field.id, factId: preferred.id, value: '', source: 'empty', confidence: 0,
-      reason: `存在 ${distinctValues.size} 个不同候选值，请确认`, candidates, status: 'needs-confirmation',
-      reasonCode: 'multiple-candidates', slot
-    }
-  }
+  const preferred = [...matched].sort((left, right) => (right.confidence ?? 0.95) - (left.confidence ?? 0.95))[0]
 
   // 5. 校验闸门（AI 结果同样经过）；粒度适配值仅在通过闸门后使用。
   // 本地已精确命中槽位时同样应用适配（如生源地按表单要求截取到市）。
-  return gatedResolution(field, preferred, slot, suggestion?.adaptedValue, candidates, viaAi, suggestion?.confidence, threshold)
+  const adapted = suggestion?.factId && suggestion.factId !== preferred.id ? undefined : suggestion?.adaptedValue
+  const resolved = gatedResolution(field, preferred, slot, adapted, candidates, viaAi, suggestion?.confidence, threshold)
+  if (distinctValues.size > 1 && resolved.status === 'ready') {
+    return {
+      ...resolved,
+      confidence: Math.min(resolved.confidence, preferred.confidence ?? 0.8, 0.8),
+      reason: `知识库有 ${distinctValues.size} 个不同值，已选置信率最高的候选`,
+      reasonCode: 'multiple-candidates'
+    }
+  }
+  return resolved
 }

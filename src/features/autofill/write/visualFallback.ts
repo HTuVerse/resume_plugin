@@ -4,6 +4,7 @@ import { readCurrentValue } from '../scan/collector'
 import { splitCascadeValue } from './recognizers'
 import { fillCandidates, valuesEquivalent, type FillExecution, type FillRecovery, type UndoRecord } from './writeMachine'
 import { pollUntil, wait } from './domUtils'
+import { withTrustedInput } from './trustedInput'
 
 interface ViewRect {
   left: number
@@ -116,7 +117,7 @@ export async function warmupVisualAssist(): Promise<VisualWarmupState> {
 
 async function realClick(x: number, y: number): Promise<boolean> {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return false
-  const response = await withoutAssistantOverlay(() => runtimeMessage({ type: 'VISUAL_REAL_CLICK', x, y }))
+  const response = await withTrustedInput(() => withoutAssistantOverlay(() => runtimeMessage({ type: 'VISUAL_REAL_CLICK', x, y })))
   return response.ok === true
 }
 

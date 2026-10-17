@@ -26,4 +26,14 @@ describe('槽位感知值语义', () => {
     expect(semanticValuesMatch('550', '550分', { slot: slotById('skill.englishScore') })).toBe(true)
     expect(semanticValuesMatch('英语、日语', '日语,英语', { field: { kind: 'multiselect' } })).toBe(true)
   })
+
+  it('级联投影命中与知识原值视为一致，避免投影填写后被当作修正重复入库', () => {
+    expect(semanticValuesMatch('江西省吉安市永丰县', '江西 / 吉安 / 永丰', { field: { kind: 'cascade' } })).toBe(true)
+  })
+
+  it('下拉/组合框选项同义等价视为一致', () => {
+    expect(semanticValuesMatch('本科', '学士', { field: { kind: 'select' } })).toBe(true)
+    expect(semanticValuesMatch('本科', '硕士', { field: { kind: 'select' } })).toBe(false)
+    expect(semanticValuesMatch('北京', '北京市', { field: { kind: 'combobox' } })).toBe(true)
+  })
 })

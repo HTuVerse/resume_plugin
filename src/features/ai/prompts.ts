@@ -44,19 +44,22 @@ export const RESUME_EXTRACTOR_RETRY_SYSTEM = `从简历原文中提取全部个�
  * 模型同时看到表单字段和知识库内容，输出每个字段该用哪条知识、值是否需要按表单粒度截取。
  * adaptedValue 必须是原值的连续子串，本地会校验，模型不能编造。
  */
-export const FIELD_MATCHER_SYSTEM = `你负责把一张网页申请表的字段与用户的知识库对应起来。你会收到两类信息：表单字段（标签、占位符、所在区块、控件类型、选项集合）和知识库（每条含 factId、板块、字段名、值）。
+export function fieldMatcherSystem(sectionIds?: ReadonlySet<string>): string { return `你负责把一张网页申请表的字段与用户的知识库对应起来。你会收到两类信息：表单字段（标签、占位符、所在区块、控件类型、选项集合）和知识库（每条含 factId、板块、字段名、值）。
 槽位清单（slot 只能使用清单内的 ID）：
-${promptSlotCatalog()}
+${promptSlotCatalog(sectionIds)}
 
-对每个你能确定的表单字段返回一条匹配，包含：
-- slot：当字段属于上面槽位清单时，返回对应槽位 ID。按含义判断而不是字面：名字 / your name → personal.name，毕业院校 / 就读学校 → education.school，联系电话 → personal.phone。教育经历里的毕业时间是 education.endDate，基本信息里的预计毕业时间是 personal.graduationDate。字段给出了 localSlot 时不得改成其他槽位。板块看不出来时，不要在多个同名槽位里猜一个。选项集合是强证据（男/女 → personal.gender）。
+对每个能从字段信息和知识库找到候选的表单字段返回一条匹配；有多个候选时选最可能的一条，即使把握较低也返回并如实给出 confidence。完全没有知识库对应数据时不要返回。包含：
+- 先判定字段所属的主体/板块及重复记录，再在该范围内比较候选置信度。同名字段不能跨主体引用知识条目；主体或记录无法从区块、标签、邻近文字、限定词判断时不要猜填。
+- slot：当字段属于上面槽位清单时，返回对应槽位 ID。按含义判断而不是字面：名字 / your name → personal.name，毕业院校 / 就读学校 → education.school，联系电话 → personal.phone。教育经历里的毕业时间是 education.endDate，基本信息里的预计毕业时间是 personal.graduationDate。字段给出了 localSlot 时不得改成其他槽位。多个同名槽位时结合板块和知识库选择最可能者，并降低 confidence。选项集合是强证据（男/女 → personal.gender）。
 - factId：当表单字段能对应知识库中的某条记录时，返回该记录的 factId。尤其是知识库自定义字段不在槽位清单中时，必须直接返回 factId，并省略 slot；不要为了满足槽位清单而硬套一个错误 slot。factId 只能引用输入知识库中真实存在的记录。
 - adaptedValue：仅当表单要求的粒度比知识库的值更粗时才填，且必须是原值的连续片段。例如知识库「高考生源地」为「江西吉安永丰」、表单只要填写到市，则 adaptedValue 填「江西吉安」；表单选项只有省份时填「江西」。不需要截取时不要返回该项，留空表示使用原值。
-- 绝不编造知识库中不存在的内容，拿不准的字段不要返回。confidence 在 0 到 1 之间如实反映把握。
+- 绝不编造知识库中不存在的内容。只要有候选就返回得分最高者；confidence 在 0 到 1 之间如实反映把握，不以低置信率为由省略。
 
 只返回一个 JSON 对象，不要 Markdown 或解释：
 {"matches":[{"fieldId":"...","slot":"personal.nativePlace","factId":"...","adaptedValue":"江西吉安","confidence":0.9,"reason":"表单要求到市，从生源地截取"},{"fieldId":"...","factId":"custom-fact-id","confidence":0.94,"reason":"表单字段与知识库自定义字段含义一致"}]}
-没有能确定的字段时返回 {"matches":[]}。`
+没有能确定的字段时返回 {"matches":[]}。` }
+
+export const FIELD_MATCHER_SYSTEM = fieldMatcherSystem()
 
 export function polishSystem(maxLength: number): string {
   return `你是求职材料润色助手。不得虚构事实、数字、技能或成果；输出纯文本，不要 Markdown，长度不超过 ${Math.max(50, maxLength)} 字。`

@@ -13,7 +13,7 @@ import { SECTIONS, sectionLabel } from './sections'
  * 词典升级时递增 SLOT_REGISTRY_VERSION，使 AI 匹配缓存自动失效（F43）。
  */
 
-export const SLOT_REGISTRY_VERSION = 4
+export const SLOT_REGISTRY_VERSION = 5
 
 const DEGREE_ENUM = DEGREE_LADDER.slice(1) // 初中及以上
 
@@ -582,8 +582,8 @@ export function promptFieldSchema(): string {
 }
 
 /** 生成 AI 槽位匹配用的槽位清单（有限枚举，模型输出不在清单内即丢弃）。 */
-export function promptSlotCatalog(): string {
-  const lines = SECTIONS.map(section => {
+export function promptSlotCatalog(sectionIds?: ReadonlySet<string>): string {
+  const lines = SECTIONS.filter(section => !sectionIds || sectionIds.has(section.id)).map(section => {
     const slots = slotsBySection(section.id)
     if (!slots.length) return ''
     const entries = slots.map(slot => `${slot.id}（${slot.aliases[0]}）`).join('、')

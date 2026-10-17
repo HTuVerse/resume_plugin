@@ -83,6 +83,23 @@ export function beginPanelDrag(clientX: number, clientY: number): void {
   window.parent.postMessage({ type: 'PANEL_REQUEST', requestId: `drag-${Date.now()}`, message: { type: 'DRAG_PANEL', clientX, clientY } }, parentOrigin)
 }
 
+export function setPanelBusy(busy: boolean): void {
+  window.parent.postMessage({ type: 'PANEL_REQUEST', requestId: `busy-${Date.now()}`, message: { type: 'SET_PANEL_BUSY', busy } }, parentOrigin)
+}
+
+export interface FillOverlayState {
+  phase: 'scan' | 'local' | 'ai' | 'done'
+  processed: number
+  total: number
+  aiAnalyzed: number
+  aiTotal: number
+  status: string
+}
+
+export function setFillOverlay(state: FillOverlayState | null): void {
+  window.parent.postMessage({ type: 'PANEL_REQUEST', requestId: `overlay-${Date.now()}`, message: { type: 'SET_FILL_OVERLAY', state } }, parentOrigin)
+}
+
 export function onContentEvent(listener: (event: any) => void): () => void {
   eventListeners.add(listener)
   return () => eventListeners.delete(listener)

@@ -215,9 +215,6 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
   const candidates = fillCandidates(request)
   let reopenBudget = MAX_REOPEN_RETRIES
   let rerenderBudget = 1
-  const trustedAvailable = Boolean(recognizer.trustedWrite && ref.control?.capabilities.canTrustedInput !== false)
-  let preferredTrustedBudget = trustedAvailable && request.preferredStrategy === `trusted:${recognizer.id}` ? 1 : 0
-  let trustedBudget = trustedAvailable && !preferredTrustedBudget ? 1 : 0
   let lastReason: NonNullable<FillResult['reasonCode']> = 'timeout'
   let lastDetail = ''
   let lastStrategy = recognizer.id
@@ -228,25 +225,19 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
     const projected = request.valueMode === 'match-options' && select
       ? projectOptionFromValue(Array.from(select.options).map(option => option.text), sourceValue)
       : null
-    const value = projected && !projected.ambiguous ? projected.value : sourceValue
+    const value = projected ? projected.value : sourceValue
+    // 原生 select 走模糊投影或并列最高分时，用橙色标记写入结果。
+    const nativeProjected = Boolean(projected && (projected.reason === 'projection' || projected.ambiguous))
     attempts += 1
-    const usePreferredTrusted = preferredTrustedBudget > 0 && Boolean(recognizer.trustedWrite)
-    if (usePreferredTrusted) preferredTrustedBudget -= 1
-    const attemptStrategy = usePreferredTrusted ? `trusted:${recognizer.id}` : recognizer.id
+    const attemptStrategy = recognizer.id
     lastStrategy = attemptStrategy
-    const attempt = usePreferredTrusted
-      ? await recognizer.trustedWrite!({ ref, request }, value)
-      : await recognizer.write({ ref, request }, value)
+    const attempt = await recognizer.write({ ref, request }, value)
 
     if (!attempt.applied) {
       lastReason = attempt.reasonCode || 'no-matching-option'
       lastDetail = attempt.detail || ''
       // 轨迹只记录失败类别，不复制候选值或页面回读正文，避免诊断信息携带隐私。
       note('apply', 'failed', lastReason, attemptStrategy)
-      if (usePreferredTrusted) {
-        note('apply', 'retry', '历史优选策略失败，回退标准交互', recognizer.id)
-        continue
-      }
       if (lastReason === 'option-list-not-found' && reopenBudget > 0) {
         // 点击空白收起后重新展开
         reopenBudget -= 1
@@ -264,30 +255,17 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
     }
     note('apply', attempts > 1 ? 'retry' : 'ok', `第 ${attempts} 次写入已执行`, attemptStrategy)
 
-    let settled = await settle(ref, recognizer, value, recognizer.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT)
+    const settled = await settle(ref, recognizer, value, recognizer.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT)
     note('settle', settled.status === 'ok' ? 'ok' : 'failed', settled.actual ? '页面已返回非空值' : settled.status, attemptStrategy)
-    const shouldTryTrusted = settled.status === 'timeout' || (settled.status === 'cleared' && rerenderBudget === 0)
-    if (shouldTryTrusted && trustedBudget > 0 && recognizer.trustedWrite) {
-      trustedBudget -= 1
-      attempts += 1
-      lastStrategy = `trusted:${recognizer.id}`
-      note('apply', 'retry', '普通 DOM 交互未通过回读，切换可信输入', `trusted:${recognizer.id}`)
-      const trusted = await recognizer.trustedWrite({ ref, request }, value)
-      if (trusted.applied) {
-        settled = await settle(ref, recognizer, value, recognizer.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT)
-        note('settle', settled.status === 'ok' ? 'ok' : 'failed', settled.status === 'ok' ? '可信输入通过回读' : 'trusted-input-failed', `trusted:${recognizer.id}`)
-      } else {
-        lastReason = 'trusted-input-failed'
-        note('apply', 'failed', 'trusted-input-failed', `trusted:${recognizer.id}`)
-      }
-    }
     if (settled.status === 'ok') {
       note('verify', 'ok', '页面回读一致', lastStrategy)
+      const needsReview = nativeProjected || Boolean(attempt.viaProjection)
       return {
         result: {
-          fieldId: request.fieldId, status: 'filled', message: '已填写并回读确认',
+          fieldId: request.fieldId, status: 'filled',
+          message: needsReview ? '已按最匹配选项填写，已用橙色提示' : '已填写并回读确认',
           value, source: request.source, confidence: request.confidence,
-          reasonCode: 'ok', attempts, elapsedMs: Date.now() - startedAt, trace
+          needsReview, reasonCode: 'ok', attempts, elapsedMs: Date.now() - startedAt, trace
         },
         undo
       }
@@ -309,7 +287,6 @@ export async function executeFill(request: FillRequest, locate: () => FieldRef |
       return fail(request, 'cleared-by-rerender', '填写后被页面重渲染清空，且字段无法重新定位', attempts, startedAt, trace)
     }
     lastReason = settled.status === 'cleared' ? 'cleared-by-rerender' : 'timeout'
-    if (!trustedBudget && recognizer.trustedWrite) lastReason = 'trusted-input-failed'
     lastDetail = `回读值：${settled.actual || '空'}`
     break
   }

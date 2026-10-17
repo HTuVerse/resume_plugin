@@ -259,51 +259,6 @@ async function captureForVisual(sender: chrome.runtime.MessageSender, message: R
   }
 }
 
-async function withDebugger(tabId: number, run: (target: chrome.debugger.Debuggee) => Promise<void>): Promise<VisualReply> {
-  const target: chrome.debugger.Debuggee = { tabId }
-  let attached = false
-  try {
-    await chrome.debugger.attach(target, '1.3')
-    attached = true
-    await run(target)
-    return { ok: true, available: true }
-  } catch (error) {
-    return { ok: false, available: true, error: `可信输入失败：${String(error)}` }
-  } finally {
-    if (attached) await chrome.debugger.detach(target).catch(() => undefined)
-  }
-}
-
-async function dispatchRealClick(tabId: number, x: number, y: number): Promise<VisualReply> {
-  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
-    return { ok: false, error: '视觉坐标无效' }
-  }
-  return withDebugger(tabId, async target => {
-    const common = { x, y, button: 'left' as const, clickCount: 1 }
-    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...common })
-    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...common })
-  })
-}
-
-async function dispatchTrustedText(tabId: number, text: string): Promise<VisualReply> {
-  return withDebugger(tabId, async target => {
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Control', code: 'ControlLeft', modifiers: 2 })
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'a', code: 'KeyA', modifiers: 2 })
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 2 })
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Control', code: 'ControlLeft' })
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Backspace', code: 'Backspace' })
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' })
-    await chrome.debugger.sendCommand(target, 'Input.insertText', { text })
-  })
-}
-
-async function dispatchTrustedScroll(tabId: number, x: number, y: number, deltaY: number): Promise<VisualReply> {
-  if (![x, y, deltaY].every(Number.isFinite) || x < 0 || y < 0) return { ok: false, error: '滚轮坐标无效' }
-  return withDebugger(tabId, async target => {
-    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY })
-  })
-}
-
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return
   const tabId = tab.id
@@ -376,24 +331,9 @@ chrome.runtime.onMessage.addListener((message: { type: string; frameId?: number;
     return true
   }
 
-  if (message.type === 'VISUAL_REAL_CLICK') {
-    dispatchRealClick(tabId, Number(message.x), Number(message.y)).then(respond)
-    return true
-  }
-
-  if (message.type === 'TRUSTED_CLICK') {
-    dispatchRealClick(tabId, Number(message.x), Number(message.y)).then(respond)
-    return true
-  }
-
-  if (message.type === 'TRUSTED_REPLACE_TEXT') {
-    dispatchTrustedText(tabId, String(message.text || '')).then(respond)
-    return true
-  }
-
-  if (message.type === 'TRUSTED_SCROLL') {
-    dispatchTrustedScroll(tabId, Number(message.x), Number(message.y), Number(message.deltaY)).then(respond)
-    return true
+  if (['VISUAL_REAL_CLICK', 'TRUSTED_CLICK', 'TRUSTED_REPLACE_TEXT', 'TRUSTED_SCROLL'].includes(message.type)) {
+    respond({ ok: false, error: '自动填写已停用浏览器调试输入' })
+    return false
   }
 
   if (message.type === 'FRAME_HELLO') {
@@ -435,6 +375,17 @@ chrome.runtime.onMessage.addListener((message: { type: string; frameId?: number;
       type: 'FRAME_OBSERVED',
       fieldId: message.fieldId,
       value: message.value || '',
+      sourceFrameId: sender.frameId ?? 0
+    }, { frameId: 0 }).catch(() => undefined)
+    respond({})
+    return false
+  }
+
+  if (message.type === 'FRAME_FILL_PROGRESS') {
+    chrome.tabs.sendMessage(tabId, {
+      type: 'FRAME_FILL_PROGRESS',
+      runId: message.runId,
+      result: message.result,
       sourceFrameId: sender.frameId ?? 0
     }, { frameId: 0 }).catch(() => undefined)
     respond({})

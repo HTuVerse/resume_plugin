@@ -72,7 +72,10 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
         continue
       }
       if (match.ambiguous) {
-        return { ok: true, value, needsConfirmation: true, reason: `「${single}」在选项集中有多个匹配，请确认`, reasonCode: 'needs-confirmation' }
+        matched.push(field.options[match.index])
+        converted = { from: single, to: field.options[match.index] }
+        weakConversion = true
+        continue
       }
       matched.push(field.options[match.index])
       if (match.reason !== 'exact') {
@@ -91,19 +94,19 @@ export function gateValue(slot: SlotDef | undefined, field: FormField, rawValue:
       }
       return {
         ok: true, value, needsConfirmation: true,
-        reason: `「${converted.from}」已按同义值转换为选项「${converted.to}」，请确认`,
+        reason: `「${converted.from}」已选择当前最匹配的选项「${converted.to}」`,
         reasonCode: 'needs-confirmation'
       }
     }
   }
 
-  // 5. 长度校验：超长不静默截断，转待确认
+  // 5. 长度校验：截断后保留提示，由页面写入回读确认实际结果。
   if (field.maxLength > 0 && value.length > field.maxLength) {
     return {
       ok: true,
       value: value.slice(0, field.maxLength),
       needsConfirmation: true,
-      reason: `内容超出页面限制（${value.length}/${field.maxLength} 字），已按限制截断，请确认`,
+      reason: `内容超出页面限制（${value.length}/${field.maxLength} 字），已按限制截断并用橙色提示`,
       reasonCode: 'value-truncated'
     }
   }

@@ -14,8 +14,8 @@ function forms(value: string): string[] {
 }
 
 /**
- * 用控件此刻真正可选的值约束知识原值。只有唯一最高分候选才返回，
- * 因而可用于任意“一个值投影到多个选择控件”的场景，不依赖字段名称。
+ * 用控件此刻真正可选的值约束知识原值。返回最高分候选，
+ * 并列时稳定选择首个且标记 ambiguous，供写入结果用提示色标注。
  */
 export function projectOptionFromValue(options: string[], rawValue: string, excluded: string[] = []): ProjectedOption | null {
   const direct = matchOption(options, rawValue)

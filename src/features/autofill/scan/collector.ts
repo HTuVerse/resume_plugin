@@ -290,7 +290,7 @@ function displayedSelection(element: HTMLElement): string {
 /** 下拉框包在 label 里时，标签全文会带上所有选项，学习时会被当成无效字段丢掉。 */
 function controlLabel(element: HTMLElement, kind: FieldKind): ReturnType<typeof resolveLabel> {
   const asked = kind === 'radio' || kind === 'checkbox' || kind === 'select' || kind === 'multiselect' || kind === 'combobox' || kind === 'cascade'
-    ? questionLabel(element)
+    ? questionLabel(element, kind === 'select' || kind === 'multiselect' || kind === 'combobox' || kind === 'cascade')
     : resolveLabel(element)
   if ((kind === 'select' || kind === 'multiselect') && element instanceof HTMLSelectElement) {
     let text = asked.text

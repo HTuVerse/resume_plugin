@@ -1,7 +1,8 @@
 import { parseJsonResponse } from './responseParser'
-import { FIELD_MATCHER_SYSTEM, polishSystem, RESUME_EXTRACTOR_RETRY_SYSTEM, RESUME_EXTRACTOR_SYSTEM } from './prompts'
+import { fieldMatcherSystem, polishSystem, RESUME_EXTRACTOR_RETRY_SYSTEM, RESUME_EXTRACTOR_SYSTEM } from './prompts'
 import { slotById } from '../ontology/slotRegistry'
 import { factToSlot } from '../autofill/match/factToSlot'
+import { hasUnresolvedSubject, subjectSectionOf } from '../autofill/match/subjectScope'
 import { aiFail, aiOk, type AiProvider, type AiResult, type ChatMessage, type FieldMatchResult, type PolishResult, type ResumeExtraction } from './aiProvider'
 import type { AiSettings, Fact, FormField, SlotSuggestion } from '../../domain/types'
 
@@ -148,15 +149,21 @@ export function parseFieldMatchSuggestions(value: any, fields: FormField[], fact
     if (!item || typeof item !== 'object') continue
     const fieldId = typeof item.fieldId === 'string' ? item.fieldId : ''
     const field = fieldsById.get(fieldId)
-    if (!field) continue
+    if (!field || hasUnresolvedSubject(field)) continue
+    const subjectSection = subjectSectionOf(field)
 
     const requestedSlot = typeof item.slot === 'string' && slotById(item.slot) ? item.slot : undefined
-    // 第一层已经认出的页面语义优先，第二层不能把它改到另一个槽位。
-    if (field.slot && requestedSlot && field.slot !== requestedSlot) continue
+    if (subjectSection && requestedSlot && slotById(requestedSlot)?.section !== subjectSection) continue
+    const localSlot = field.slot && (!subjectSection || slotById(field.slot)?.section === subjectSection) ? field.slot : undefined
+    // 本地确定匹配保持优先；本地歧义时允许 AI 改选更合适的候选。
+    if (localSlot && field.slotStatus !== 'ambiguous' && requestedSlot && localSlot !== requestedSlot) continue
 
     const fact = typeof item.factId === 'string' ? factsById.get(item.factId) : undefined
-    const knownFactSlot = fact ? factToSlot(fact).slot : undefined
-    const slot = requestedSlot || field.slot || knownFactSlot
+    const factScope = fact ? factToSlot(fact) : undefined
+    if (subjectSection && factScope && factScope.section !== subjectSection) continue
+    const knownFactSlot = factScope?.slot
+    const slot = requestedSlot || (field.slotStatus === 'ambiguous' ? undefined : localSlot) || knownFactSlot
+    if (subjectSection && slot && slotById(slot)?.section !== subjectSection) continue
     // 已能由本地本体识别的知识条目，不允许被 AI 指向语义冲突的槽位。
     if (slot && knownFactSlot && slot !== knownFactSlot) continue
     if (!slot && !fact) continue
@@ -165,12 +172,13 @@ export function parseFieldMatchSuggestions(value: any, fields: FormField[], fact
     const adaptedValue = fact && adapted && adapted !== fact.value.trim() && fact.value.includes(adapted)
       ? adapted
       : undefined
+    const reportedConfidence = item.confidence == null || item.confidence === '' ? Number.NaN : Number(item.confidence)
     const suggestion: SlotSuggestion = {
       fieldId,
       slot,
       factId: fact?.id,
       adaptedValue,
-      confidence: Math.min(1, Math.max(0, Number(item.confidence) || 0.6)),
+      confidence: Number.isFinite(reportedConfidence) ? Math.min(1, Math.max(0, reportedConfidence)) : 0.6,
       reason: String(item.reason || 'AI 语义判定')
     }
     const previous = bestByField.get(fieldId)
@@ -298,14 +306,16 @@ export class OpenAICompatibleProvider implements AiProvider {
   async matchFields(fields: FormField[], facts: Fact[] = []): Promise<AiResult<FieldMatchResult>> {
     if (!fields.length) return aiOk({ suggestions: [] })
     const knowledge = facts.filter(fact => fact.value.trim()).slice(0, 300)
+    const sections = new Set(fields.map(field => field.sectionId).filter((id): id is NonNullable<typeof id> => Boolean(id)))
+    const catalog = sections.size === 1 && fields.every(field => Boolean(field.sectionId)) ? sections : undefined
     const parsed = parseJsonResponse(await this.chat([
-      { role: 'system', content: FIELD_MATCHER_SYSTEM },
+      { role: 'system', content: fieldMatcherSystem(catalog) },
       {
         role: 'user',
         content: JSON.stringify({
-          fields: fields.slice(0, 300).map(({ id, label, group, placeholder, kind, options, required, maxLength, item, sectionId, slot, slotStatus }) => ({
-            id, label, group, placeholder, kind, options: options.slice(0, 100), required, maxLength, item, section: sectionId,
-            localSlot: slot, localStatus: slotStatus
+          fields: fields.slice(0, 300).map(({ id, label, group, placeholder, nearbyText, recordQualifier, kind, options, required, maxLength, item, sectionId, slot, slotStatus }) => ({
+            id, label, group, placeholder, nearbyText, recordQualifier, kind, options: options.slice(0, 100), required, maxLength, item, section: sectionId,
+            localSlot: slotStatus === 'resolved' ? slot : undefined, localStatus: slotStatus
           })),
           knowledge: knowledge.map(({ id, group, item, key, value }) => ({ factId: id, group, item, key, value: value.slice(0, 300) }))
         })

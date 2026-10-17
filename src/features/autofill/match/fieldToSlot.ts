@@ -6,6 +6,7 @@ import { isPlaceholderOption } from '../../ontology/optionMatch'
 import { SLOTS, aliasHit, aliasSectionCount, legacyAliasHit, slotById } from '../../ontology/slotRegistry'
 import { findSiteRule } from '../../siteRules/ruleStore'
 import { sameValue } from '../../ontology/synonyms'
+import { subjectSectionOf } from './subjectScope'
 
 /**
  * 页面字段 → 槽位的多信号加权打分与决策（F02/F03，TECH_DESIGN §5）。
@@ -195,9 +196,10 @@ function findLearned(field: FormField, aliases: LearnedAlias[] | undefined): Lea
 }
 
 export function scoreFieldSlots(field: FormField, context: ScoreContext = {}): SlotScore[] {
+  const subjectSection = subjectSectionOf(field)
   // 站点规则短路（F25）：指纹优先，其次是用户确认过的同类标签。
   const rule = findSiteRule(context.siteRules, field)
-  if (rule) {
+  if (rule && (!subjectSection || slotById(rule.slot)?.section === subjectSection)) {
     return [{ slot: rule.slot, score: 1, locked: true, signals: { siteRule: 1 } }]
   }
   // 学到的别名：全等锁定。带板块的别名只在该板块生效。
@@ -206,16 +208,18 @@ export function scoreFieldSlots(field: FormField, context: ScoreContext = {}): S
   const learnedSlot = learned ? slotById(learned.slot) : undefined
   const learnedApplies = Boolean(
     learned && learnedSlot
+    && (!subjectSection || learnedSlot.section === subjectSection)
     && (learned.sectionId
-      ? field.sectionId === learned.sectionId
-      : (!field.sectionId || learnedSlot.section === field.sectionId)
-        && (field.sectionId || aliasSectionCount(field.label) < 2))
+      ? subjectSection === learned.sectionId
+      : (!subjectSection || learnedSlot.section === subjectSection)
+        && (subjectSection || aliasSectionCount(field.label) < 2))
   )
   if (learnedApplies && learned) {
     return [{ slot: learned.slot, score: 1, locked: true, signals: { learnedAlias: 1 } }]
   }
   const scored: SlotScore[] = []
   for (const slot of SLOTS) {
+    if (subjectSection && slot.section !== subjectSection) continue
     const { excluded, values } = collectSignals(field, slot)
     if (excluded) continue
     let sum = 0

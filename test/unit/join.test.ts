@@ -17,12 +17,13 @@ describe('gateValue（F04 硬闸门）', () => {
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reasonCode).toBe('rejected-by-validation')
   })
-  it('PRD F04 验收：简历写「本科」、页面只有 高中/专科/学士/硕士 → 给出「学士」待确认候选，而非直接填入或静默丢弃', () => {
+  it('PRD F04 验收：简历写「本科」、页面只有 高中/专科/学士/硕士 → 按确定性同义值归一到「学士」', () => {
     const field = makeField({ kind: 'select', options: ['高中', '专科', '学士', '硕士'] })
     const result = gateValue(slotById('education.degree'), field, '本科')
     expect(result.ok).toBe(true)
     if (result.ok) {
-      expect(result.needsConfirmation).toBe(true)
+      // 学士 ≡ 本科 属词典内确定性同义值，直接归一，无需额外确认（前缀等弱匹配才待确认）。
+      expect(result.needsConfirmation).toBe(false)
       expect(result.value).toBe('学士')
     }
   })
@@ -32,14 +33,20 @@ describe('gateValue（F04 硬闸门）', () => {
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reasonCode).toBe('no-matching-option')
   })
-  it('组件下拉有选项集时和原生 select 一样拒绝对不上的值', () => {
-    const field = makeField({ kind: 'combobox', options: ['本科', '硕士'] })
+  it('组件下拉在选项集已证明完整时和原生 select 一样拒绝对不上的值', () => {
+    // 自定义下拉默认选项集不完整（虚拟列表/远程搜索），只有 complete 才在闸门处断言不存在。
+    const field = makeField({ kind: 'combobox', options: ['本科', '硕士'], optionCoverage: 'complete' })
     const result = gateValue(slotById('education.degree'), field, '博士')
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reasonCode).toBe('no-matching-option')
   })
-  it('多选按选项逐个校验', () => {
-    const field = makeField({ kind: 'multiselect', options: ['英语', '日语'] })
+  it('组件下拉选项集未证明完整时放行，交给写入器展开后投影匹配', () => {
+    const field = makeField({ kind: 'combobox', options: ['本科', '硕士'] })
+    const result = gateValue(slotById('education.degree'), field, '博士')
+    expect(result.ok).toBe(true)
+  })
+  it('多选在选项集完整时按选项逐个校验', () => {
+    const field = makeField({ kind: 'multiselect', options: ['英语', '日语'], optionCoverage: 'complete' })
     const result = gateValue(undefined, field, '英语、韩语')
     expect(result.ok).toBe(false)
   })

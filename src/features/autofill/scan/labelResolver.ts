@@ -48,7 +48,7 @@ function hasControl(element: HTMLElement): boolean {
 
 /** 不含控件的短标题。带输入框的上一整行不能拿来当这一行的字段名。 */
 function labelOnlyText(element: HTMLElement): string {
-  if (hasControl(element)) return ''
+  if (element.matches('input,textarea,select,[role="combobox"],[role="textbox"],[role="spinbutton"],[contenteditable="true"]') || hasControl(element)) return ''
   const text = cleanText(element.textContent)
   if (!text || text.length > 40 || looksLikeFieldPrompt(text) || isFieldIdentifier(text) || sectionOfText(text)) return ''
   return text
@@ -93,6 +93,30 @@ function acceptLabel(text: string, source: LabelSource): ResolvedLabel | null {
   const named = looksLikeFieldPrompt(cleaned) || isFieldIdentifier(cleaned) ? labelFromPlaceholder(cleaned) : cleaned
   if (!named || isFieldIdentifier(named) || looksLikeFieldPrompt(named)) return null
   return { text: named, source }
+}
+
+/** 有些组件把 .form-item-control 也命名为 form-item；向上找到真正带题目标签的表单项。 */
+function formItemLabel(element: HTMLElement): { item: HTMLElement; label: HTMLElement } | null {
+  for (let item = element.closest<HTMLElement>(FORM_ITEM_SELECTOR); item; item = item.parentElement?.closest<HTMLElement>(FORM_ITEM_SELECTOR) || null) {
+    const label = Array.from(item.querySelectorAll<HTMLElement>(FORM_ITEM_LABEL_SELECTOR))
+      .find(node => !node.contains(element)
+        && !node.closest('select,[role="combobox"]')
+        && !(node instanceof HTMLLabelElement && node.control && node.control !== element && !element.contains(node.control)))
+    if (label) return { item, label }
+  }
+  return null
+}
+
+/** 没有组件库 class 的普通行：一个题目标签同时包着前置选择框和后续输入框。 */
+function plainCompoundItem(element: HTMLElement): HTMLElement | null {
+  let parent = element.parentElement
+  for (let depth = 0; parent && parent !== document.body && depth < 4; depth += 1, parent = parent.parentElement) {
+    const labels = Array.from(parent.querySelectorAll('label'))
+      .filter(label => !label.contains(element) && !label.closest('select,[role="combobox"]'))
+    const controls = parent.querySelectorAll('input,textarea,select,[role="combobox"]')
+    if (labels.length === 1 && controls.length <= 3) return parent
+  }
+  return null
 }
 
 /**
@@ -147,10 +171,9 @@ export function resolveLabel(element: HTMLElement): ResolvedLabel {
     if (accepted) return accepted
   }
   // 4. 表单项容器内的 label 节点
-  const formItem = element.closest(FORM_ITEM_SELECTOR)
+  const formItem = formItemLabel(element)
   if (formItem) {
-    const nearby = formItem.querySelector(FORM_ITEM_LABEL_SELECTOR)
-    const accepted = acceptLabel(nearby?.textContent || '', 'container')
+    const accepted = acceptLabel(formItem.label.textContent || '', 'container')
     if (accepted) return accepted
   }
   // 5. 往上找不含控件的短标题（中文 label 常在再外一层）
@@ -240,10 +263,20 @@ export function optionLabel(element: HTMLElement): string {
  * 选择题的题目（性别），而不是当前选项（男）。
  * 优先用表单项标签、legend、分组的 aria-label。
  */
-export function questionLabel(element: HTMLElement): ResolvedLabel {
-  const formItem = element.closest(FORM_ITEM_SELECTOR)
-  const labelNode = formItem ? Array.from(formItem.querySelectorAll(FORM_ITEM_LABEL_SELECTOR)).find(node => !node.contains(element)) : undefined
-  const labelText = cleanText(labelNode?.textContent)
+export function questionLabel(element: HTMLElement, leadingChoice = false): ResolvedLabel {
+  const formItem = formItemLabel(element)
+  const sharedItem = formItem?.item || (leadingChoice ? plainCompoundItem(element) : null)
+  if (leadingChoice && sharedItem) {
+    const own = resolveLabel(element)
+    if (own.source === 'for' || own.source === 'aria') return own
+    const hasFollowingInput = Array.from(sharedItem.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input,textarea'))
+      .some(input => !element.contains(input) && input !== element
+        && !['hidden', 'radio', 'checkbox'].includes(input.type)
+        && Boolean(element.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING))
+    // 一个标题覆盖“前置选项 + 后续输入”时，它命名的是整道题，不能据此把选项值归为输入值。
+    if (hasFollowingInput) return { text: '', source: 'none' }
+  }
+  const labelText = cleanText(formItem?.label.textContent)
   if (labelText && labelText.length < 80) return { text: labelText, source: 'container' }
   const group = element.closest(CHOICE_GROUP_SELECTOR)
   const legend = cleanText(group?.querySelector(':scope > legend')?.textContent)

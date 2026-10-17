@@ -16,7 +16,9 @@ function localWorker(): ReturnType<typeof createWorker> {
       corePath: base,
       langPath: `${base}/lang`,
       workerBlobURL: false,
-      gzip: true,
+      // 语言数据以未压缩的 .traineddata 随包提供（见 prepare-ocr-assets.mjs）：
+      // 微软/Edge 商店不允许扩展包内再含 .gz/.zip 等压缩包。
+      gzip: false,
       errorHandler: error => console.warn('本地 OCR Worker 错误', error)
     }).then(async worker => {
       await worker.setParameters({

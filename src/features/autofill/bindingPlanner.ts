@@ -1,4 +1,6 @@
 import type { FormField } from '../../domain/types'
+import { pageSegmentKey } from './pageSegment'
+import { subjectSectionOf } from './match/subjectScope'
 
 const PROJECTABLE_KINDS = new Set(['select', 'combobox', 'cascade'])
 
@@ -30,6 +32,9 @@ export function planValueBindings(
   }
   for (const [clusterId, rows] of clusters) {
     if (rows.length < 2) continue
+    // 结构相邻不等于同一主体；跨板块或跨记录的控件不可继承彼此的知识条目。
+    const scopes = new Set(rows.map(field => `${subjectSectionOf(field)}\u0000${pageSegmentKey(field, fields)}`))
+    if (scopes.size !== 1) continue
     const factIds = [...new Set(rows.map(factIdOf).filter((id): id is string => Boolean(id)))]
     // 一个结构簇中只有唯一已确认知识时，未单独识别的子控件可继承它；
     // 出现两个不同知识绑定则保持独立，禁止猜测。
@@ -47,7 +52,7 @@ export function planValueBindings(
     if (planned.has(field.id)) continue
     const factId = factIdOf(field)
     if (!factId || !PROJECTABLE_KINDS.has(field.kind)) continue
-    const structuralScope = field.repeatGroupId || field.group || field.sectionId || 'page'
+    const structuralScope = `${subjectSectionOf(field)}\u0000${pageSegmentKey(field, fields)}\u0000${field.group}`
     const key = `${field.frameId || 0}\u0000${structuralScope}\u0000${factId}`
     const rows = groups.get(key) || []
     rows.push(field)

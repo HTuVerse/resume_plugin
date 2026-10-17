@@ -3,6 +3,20 @@ interface TrustedInputReply {
   error?: string
 }
 
+const trustedInputListeners = new Set<(active: boolean) => void>()
+
+export function subscribeTrustedInput(listener: (active: boolean) => void): () => void {
+  trustedInputListeners.add(listener)
+  return () => trustedInputListeners.delete(listener)
+}
+
+export async function withTrustedInput<T>(action: () => Promise<T>): Promise<T> {
+  if (window.top !== window) return action()
+  trustedInputListeners.forEach(listener => listener(true))
+  try { return await action() }
+  finally { trustedInputListeners.forEach(listener => listener(false)) }
+}
+
 async function request(message: Record<string, unknown>): Promise<TrustedInputReply> {
   return chrome.runtime.sendMessage(message).catch(error => ({ ok: false, error: String(error) })) as Promise<TrustedInputReply>
 }
@@ -26,15 +40,17 @@ function visibleCenter(element: HTMLElement): { x: number; y: number } | null {
 export async function trustedClickElement(element: HTMLElement): Promise<boolean> {
   const point = visibleCenter(element)
   if (!point) return false
-  const response = await request({ type: 'TRUSTED_CLICK', ...point })
+  const response = await withTrustedInput(() => request({ type: 'TRUSTED_CLICK', ...point }))
   return response.ok === true
 }
 
 /** 聚焦后通过浏览器输入通道全选、清空、插入文本，供受控输入框拒绝合成事件时兜底。 */
 export async function trustedReplaceText(element: HTMLElement, text: string): Promise<boolean> {
   if (!element.isConnected) return false
-  element.focus({ preventScroll: true })
-  const response = await request({ type: 'TRUSTED_REPLACE_TEXT', text })
+  const response = await withTrustedInput(() => {
+    element.focus({ preventScroll: true })
+    return request({ type: 'TRUSTED_REPLACE_TEXT', text })
+  })
   return response.ok === true
 }
 
@@ -42,6 +58,6 @@ export async function trustedReplaceText(element: HTMLElement, text: string): Pr
 export async function trustedScrollElement(element: HTMLElement, deltaY: number): Promise<boolean> {
   const point = visibleCenter(element)
   if (!point) return false
-  const response = await request({ type: 'TRUSTED_SCROLL', ...point, deltaY })
+  const response = await withTrustedInput(() => request({ type: 'TRUSTED_SCROLL', ...point, deltaY }))
   return response.ok === true
 }
